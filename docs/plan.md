@@ -56,9 +56,12 @@ resort, not the next step.
   `boot.sh`, and a debug.sh one-liner. Build env: **WSL2 + musl.cc armhf
   toolchain, `-march=armv6 -mfpu=vfp -mfloat-abi=hard -static`** (verified:
   hello + fshare2fifo run on the camera).
-- **Phase 2 — video out (IN PROGRESS):** `src/fshare2fifo` (producer,
-  DONE + verified) → `/tmp/h264_high_fifo` → LIVE555 rRTSPServer (armv6
-  static build via `tools/build-rtspserver.sh`).
+- **Phase 2 — video out (DONE):** `src/fshare2fifo` (producer) →
+  `/tmp/h264_high_fifo` → LIVE555 rRTSPServer (armv6 static musl build via
+  `tools/build-armv6.sh`). **`rtsp://10.1.2.19/ch0_0.h264` streams the live
+  camera** (ffmpeg-verified). Known issues: join starts mid-GOP (decoder
+  artifacts until first IDR), occasional torn frames at ring wrap —
+  polish by waiting for SPS/IDR before emitting.
 - **Phase 3 — HA integration:** RTSP (generic camera) or ONVIF (minimal
   ws-discovery + SOAP service, or yi-hack's `wsd_simple_server` /
   `onvif_notify_server` if portable). PTZ does not need ONVIF: `pwmv2_fullhan`

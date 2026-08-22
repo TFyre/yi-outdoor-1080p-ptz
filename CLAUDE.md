@@ -46,6 +46,23 @@ Use Conventional Commits: `type(scope): description` (e.g. `feat(rtsp): …`, `f
   ```
   `-O` forces legacy SCP protocol — there is no sftp-server on the camera. Client key: `~/.ssh/yi_cam_rsa` (pubkey installed as `/root/.ssh/authorized_keys` on the camera).
 
+## RTSP streaming
+
+The live H.264 stream is exported by the stock app via the shared buffer
+`/dev/shm/fshare_frame_buf` (ring; frame counter at offset 0x18; NAL-chained
+frames). The working chain: `fshare2fifo` (reads the ring, writes
+`/tmp/h264_high_fifo`) → `rRTSPServer` (LIVE555, port 554) →
+`rtsp://10.1.2.19/ch0_0.h264`.
+
+Binaries are static musl soft-float ARMv6 builds (ARM1176-compatible) produced
+by `tools/build-armv6.sh` in WSL. Prebuilt binaries from every other
+toolchain SIGILL here: ARMv7 instructions (musl.cc armhf libs), VFPv3-D16
+hard-float (Ubuntu armhf gcc), or MIPS (RTS3903N package). Also: musl's
+64-bit time_t breaks live555's `%ld` SDP printf — the build script
+sed-fixes it; the fifo EAGAIN fix lives in `tools/vendor/`.
+
+Nothing of the RTSP chain is persistent across reboots yet — see Phase 1.
+
 ## Backup
 
 Full stock backup taken (all MTD partitions + file-level tars of `/home` and `/backup`), md5-verified on both ends:
