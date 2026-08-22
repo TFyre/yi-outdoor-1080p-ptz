@@ -35,14 +35,14 @@ Use Conventional Commits: `type(scope): description` (e.g. `feat(rtsp): …`, `f
 ## Camera access
 
 - **Telnet (bootstrap)**: `debug.sh` on the SD card root runs at boot — installs busybox 1.36.1 to `/bin` and starts `telnetd -l/bin/ash -p9999`. Connect: `telnet 10.1.2.19 9999` (no password). Non-interactive: `bash tools/camcmd.sh "command"`.
-- **SSH (preferred)**: dropbear, started manually so far — not persistent across reboots yet:
+- **SSH (preferred)**: dropbear is started by `debug.sh` at boot. The host key persists on the SD at `/tmp/sd/yi-hack-v5/etc/dropbear/ecdsa.key` (stable across reboots, so host-key pinning works). dropbearkey cannot write to vfat directly (its chmod fails), so the boot script generates in tmpfs and copies with `cat` when the key is missing. Manual restart:
   ```
-  nohup /tmp/sd/yi-hack-v5/bin/dropbearmulti dropbear -r /tmp/dropbear/ecdsa.key -E -p 2222 >/tmp/db.log 2>&1 &
+  nohup /tmp/sd/yi-hack-v5/bin/dropbearmulti dropbear -r /tmp/sd/yi-hack-v5/etc/dropbear/ecdsa.key -E -p 2222 >/tmp/db.log 2>&1 &
   ```
-  The host key must live on a POSIX filesystem (`/tmp/dropbear/`, tmpfs) — dropbear's default key dir is on the vfat SD and key generation fails there. The key regenerates on every boot, so host-key pinning is meaningless — use `UserKnownHostsFile=/dev/null`. Client side (this machine):
+  Client side (this machine):
   ```
-  ssh -i ~/.ssh/yi_cam_rsa -o PubkeyAcceptedAlgorithms=+ssh-rsa -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -p 2222 root@10.1.2.19
-  scp -O -P 2222 -i ~/.ssh/yi_cam_rsa -o PubkeyAcceptedAlgorithms=+ssh-rsa -o UserKnownHostsFile=/dev/null root@10.1.2.19:<file> <dest>
+  ssh -i ~/.ssh/yi_cam_rsa -o PubkeyAcceptedAlgorithms=+ssh-rsa -o StrictHostKeyChecking=accept-new -p 2222 root@10.1.2.19
+  scp -O -P 2222 -i ~/.ssh/yi_cam_rsa -o PubkeyAcceptedAlgorithms=+ssh-rsa -o StrictHostKeyChecking=accept-new root@10.1.2.19:<file> <dest>
   ```
   `-O` forces legacy SCP protocol — there is no sftp-server on the camera. Client key: `~/.ssh/yi_cam_rsa` (pubkey installed as `/root/.ssh/authorized_keys` on the camera).
 
