@@ -81,13 +81,16 @@ resort, not the next step.
   the producer's write-end call fails with EEXIST) and waits ~3 s for a
   chain when the window has none; (4) the fifo unlock thread no longer
   reads (it ate the first 1024 bytes = the stream head).
-  **Remaining:** ~1–2 errors/s steady + ~10 in the first 2 s of a join —
-  all traced to the ring's interleaved frame table (~31-byte-spaced
-  entries with false start codes like `00 00 01 c0` followed by
-  size/timestamp-looking fields). Next: reverse the table — the header's
-  0x04/0x0C fields look like ring write positions, and
-  `analysis/fshare*.bin` samples plus the Python NAL-scans are the seed
-  data — then emit only true video frames.
+  **Remaining:** ~1–2 errors/s — the ring's slice data contains
+  unescaped `00 00 01` patterns (the app tracks frames via its own
+  bookkeeping and never intended NAL-walking), so the producer splits
+  real slices mid-data. Also a table region holds per-frame entries
+  (~27-byte, `00 00 01`-prefixed, size/ts-looking fields; identical
+  across entries when the scene is static — hence the earlier "31-byte
+  periodicity" red herring). Next: reverse the table (header 0x04/0x0C
+  write positions + live correlation) and walk frames by offset instead
+  of start codes. Seed data: `tools/sps-scan.py`, `tools/nalscan.py`,
+  `analysis/fshare*.bin`.
 - **Phase 3 — HA integration:** RTSP (generic camera) or ONVIF (minimal
   ws-discovery + SOAP service, or yi-hack's `wsd_simple_server` /
   `onvif_notify_server` if portable). PTZ does not need ONVIF: `pwmv2_fullhan`
