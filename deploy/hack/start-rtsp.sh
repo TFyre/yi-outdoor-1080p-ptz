@@ -29,8 +29,23 @@ PID=$(pidof fshare2fifo)
 sleep 1
 rm -f /tmp/h264_high_fifo
 
-# Producer: fshare ring -> fifo (gates on the ring's frame counter)
-nohup $BIN/fshare2fifo >/tmp/fshare2fifo.log 2>&1 &
+# Producer: fshare ring -> fifo (gates on the ring's frame counter).
+# The buffer file can exist before the app has written any frames; the
+# producer exits if its initial NAL scan finds nothing, so retry until it
+# stays up (usually succeeds within a few seconds of boot).
+n=0
+while [ $n -lt 20 ]; do
+  PID=$(pidof fshare2fifo)
+  [ -n "$PID" ] && break
+  nohup $BIN/fshare2fifo >>/tmp/fshare2fifo.log 2>&1 &
+  n=$((n+1))
+  sleep 3
+done
+PID=$(pidof fshare2fifo)
+if [ -z "$PID" ]; then
+  echo "producer never came up (buffer still empty?)"
+  exit 1
+fi
 
 # Server: LIVE555 on 554, video only (audio fifo does not exist)
 sleep 2
