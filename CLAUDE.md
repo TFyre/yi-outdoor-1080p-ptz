@@ -39,10 +39,10 @@ Use Conventional Commits: `type(scope): description` (e.g. `feat(rtsp): …`, `f
   ```
   nohup /tmp/sd/yi-hack-v5/bin/dropbearmulti dropbear -r /tmp/dropbear/ecdsa.key -E -p 2222 >/tmp/db.log 2>&1 &
   ```
-  The host key must live on a POSIX filesystem (`/tmp/dropbear/`, tmpfs) — dropbear's default key dir is on the vfat SD and key generation fails there. Client side (this machine):
+  The host key must live on a POSIX filesystem (`/tmp/dropbear/`, tmpfs) — dropbear's default key dir is on the vfat SD and key generation fails there. The key regenerates on every boot, so host-key pinning is meaningless — use `UserKnownHostsFile=/dev/null`. Client side (this machine):
   ```
-  ssh -i ~/.ssh/yi_cam_rsa -o PubkeyAcceptedAlgorithms=+ssh-rsa -o StrictHostKeyChecking=no -p 2222 root@10.1.2.19
-  scp -O -P 2222 -i ~/.ssh/yi_cam_rsa -o PubkeyAcceptedAlgorithms=+ssh-rsa root@10.1.2.19:<file> <dest>
+  ssh -i ~/.ssh/yi_cam_rsa -o PubkeyAcceptedAlgorithms=+ssh-rsa -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -p 2222 root@10.1.2.19
+  scp -O -P 2222 -i ~/.ssh/yi_cam_rsa -o PubkeyAcceptedAlgorithms=+ssh-rsa -o UserKnownHostsFile=/dev/null root@10.1.2.19:<file> <dest>
   ```
   `-O` forces legacy SCP protocol — there is no sftp-server on the camera. Client key: `~/.ssh/yi_cam_rsa` (pubkey installed as `/root/.ssh/authorized_keys` on the camera).
 
