@@ -1,2 +1,9 @@
 backup/
 analysis/
+
+# build artifacts (reproducible via tools/build-*.sh in WSL)
+src/fshare2fifo/fshare2fifo
+tools/probe-vfp
+tools/probe-vfp2
+deploy/hack/bin/
+deploy/hack/etc/dropbear/ecdsa.key

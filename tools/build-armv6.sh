@@ -17,10 +17,15 @@ CROSS=$TC/bin/arm-linux-musleabi
 FLAGS="-march=armv6 -mfloat-abi=soft -static -Os"
 TARGET=${1:-all}
 
+# ARMv7 integer ops + VFPv3/NEON-only ops. Note: VFPv2 (this core) has full
+# double precision and d0-d15 multiples — probe-vfp proved vldmia {d8-d15}
+# and faddd legal on the unit, so only d16-d31 multiples are flagged.
+ARM7_PAT='\budiv\b|\bsdiv\b|\bmovw\b|\bmovt\b|\bubfx\b|\bsbfx\b|\bbfi\b|\bvmov\.f64|\bvld1\.64|\bvst1\.64|vldm[^,]*\{d1[6-9]|vldm[^,]*\{d2[0-9]|vldm[^,]*\{d3[0-1]|vstm[^,]*\{d1[6-9]|vstm[^,]*\{d2[0-9]|vstm[^,]*\{d3[0-1]'
+
 verify_armv6() {
     local n
     n=$(arm-linux-gnueabihf-objdump -d "$1" \
-        | grep -cE '\budiv\b|\bsdiv\b|\bmovw\b|\bmovt\b|\bubfx\b|\bsbfx\b|\bbfi\b|\bvldr[^s]|\bvmov\.f64|\bvld1\.64|\bvst1\.64|\bvldm.*\{d|\bvstm.*\{d' \
+        | grep -cE "$ARM7_PAT" \
         || true)
     if [ "$n" != "0" ]; then
         echo "FAIL: $1 still contains $n ARMv7-only instructions" >&2

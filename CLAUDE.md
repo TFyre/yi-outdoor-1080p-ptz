@@ -15,6 +15,7 @@ Use Conventional Commits: `type(scope): description` (e.g. `feat(rtsp): …`, `f
 ## Device facts (verified on the unit)
 
 - SoC: Fullhan **FH8626V100** — single ARMv6 core, ~35 MB RAM (MemTotal: 35904 kB). Not the Allwinner `r40ga` and not the Hi3518ev200 `h30ga` outdoor models; do not mix them up.
+- CPU: **ARM1176** (part 0xb76) with **VFPv2** — full single AND double precision, d0–d15 (verified on the unit: `tools/probe-vfp.c` runs `flds/fadds/fldd/faddd/vldmia {d8-d15}` fine, even as a process's first VFP instruction; `movw` SIGILLs as expected). What SIGILLs: ARMv7 integer ops (`udiv/sdiv/movw/movt/ubfx/sbfx/bfi`), VFPv3-only forms (`vmov.f64` immediate, d16–d31 multiples, NEON `vld1.64`). `tools/scan-v7.sh` flags exactly those.
 - Board suffix `b221fp`; stock firmware `5.0.00.00_202204281015` (`/home/homever`, `/home/app/.appver`).
 - SPI NOR flash, 64k erase size, per the kernel cmdline (`console=ttyS0,115200` — UART is the unbrick path):
 
@@ -34,17 +35,47 @@ Use Conventional Commits: `type(scope): description` (e.g. `feat(rtsp): …`, `f
 
 ## Camera access
 
-- **Telnet (bootstrap)**: `debug.sh` on the SD card root runs at boot — installs busybox 1.36.1 to `/bin` and starts `telnetd -l/bin/ash -p9999`. Connect: `telnet 10.1.2.19 9999` (no password). Non-interactive: `bash tools/camcmd.sh "command"`.
-- **SSH (preferred)**: dropbear is started by `debug.sh` at boot. The host key persists on the SD at `/tmp/sd/yi-hack-v5/etc/dropbear/ecdsa.key` (stable across reboots, so host-key pinning works). dropbearkey cannot write to vfat directly (its chmod fails), so the boot script generates in tmpfs and copies with `cat` when the key is missing. Manual restart:
-  ```
-  nohup /tmp/sd/yi-hack-v5/bin/dropbearmulti dropbear -r /tmp/sd/yi-hack-v5/etc/dropbear/ecdsa.key -E -p 2222 >/tmp/db.log 2>&1 &
-  ```
+- **Telnet (bootstrap)**: `debug.sh` on the SD card root runs at boot. Connect: `telnet 10.1.2.19 9999` (no password). Non-interactive: `bash tools/camcmd.sh "command"`.
+- **SSH (preferred)**: dropbear on 2222, started by boot.sh at boot. The host key persists on the SD at `/tmp/sd/hack/etc/dropbear/ecdsa.key` (stable across reboots, so host-key pinning works). dropbearkey cannot write to vfat directly (its chmod fails), so boot.sh generates in tmpfs and copies with `cat` when the key is missing. The listener writes `/tmp/dropbear.pid`; boot.sh skips starting if that pid is alive (idempotent re-runs).
   Client side (this machine):
   ```
   ssh -i ~/.ssh/yi_cam_rsa -o PubkeyAcceptedAlgorithms=+ssh-rsa -o StrictHostKeyChecking=accept-new -p 2222 root@10.1.2.19
   scp -O -P 2222 -i ~/.ssh/yi_cam_rsa -o PubkeyAcceptedAlgorithms=+ssh-rsa -o StrictHostKeyChecking=accept-new root@10.1.2.19:<file> <dest>
   ```
-  `-O` forces legacy SCP protocol — there is no sftp-server on the camera. Client key: `~/.ssh/yi_cam_rsa` (pubkey installed as `/root/.ssh/authorized_keys` on the camera).
+  `-O` forces legacy SCP protocol — dropbear has no sftp subsystem, so there is no sftp-server. Client key: `~/.ssh/yi_cam_rsa` (pubkey installed as `/root/.ssh/authorized_keys` on the camera).
+
+## SD hack package (`/tmp/sd/hack/`)
+
+The whole mod lives on the SD card; stock flash stays untouched. `debug.sh`
+on the SD root is a one-liner that execs `hack/boot.sh` at every boot.
+
+- `hack/boot.sh` — orchestrator (idempotent, fast): installs the static
+  busybox 1.36.1 (full applets) into `/bin` (ramdisk, redone each boot),
+  starts telnetd 9999 + dropbear 2222 (pidfile-guarded), spawns
+  `start-rtsp.sh` detached (the stock boot may wait for debug.sh to return).
+- `hack/start-rtsp.sh` — waits for `/dev/shm/fshare_frame_buf` (the app
+  creates it once the camera pipeline is up), then starts
+  `fshare2fifo` → `/tmp/h264_high_fifo` → `rRTSPServer -a no` (port 554),
+  killing previous instances first (idempotent). Limitation: if rmm
+  restarts mid-uptime and recreates its buffer, the producer's mmap goes
+  stale — re-run the script or reboot.
+- `hack/bin/` — binaries, all static armv6 (gitignored, rebuilt with
+  `tools/build-*.sh` in WSL): busybox 1.36.1, curl 8.4 (http-only, no TLS),
+  dropbearmulti 2018.76 (from the yi-hack 0.4.1 release; the source-adjacent
+  dropbear in that release is not rebuilt here), fshare2fifo, rRTSPServer.
+- `hack/root/.ssh/authorized_keys` — pubkeys boot.sh installs to
+  `/root/.ssh/` each boot (the ramdisk resets).
+- `hack/etc/dropbear/ecdsa.key` — host key (gitignored; boot.sh regenerates
+  onto the SD if missing).
+- Repo layout: `deploy/hack/` mirrors the SD folder. Deploying: tar it up,
+  scp to `/tmp`, untar in tmpfs, `cp -r` onto the SD (vfat: no chmod, no
+  symlinks — tar extraction onto vfat works but modes are ignored; scripts
+  are invoked as `sh <script>`).
+
+Mediamtx and sftp-server were deliberately not included: LIVE555 already
+serves RTSP (mediamtx would add ~10 MB to a 35 MB-RAM device), and dropbear
+has no sftp subsystem (`scp -O` covers transfers). Revisit if HLS/WebRTC is
+needed.
 
 ## RTSP streaming
 
@@ -61,7 +92,9 @@ hard-float (Ubuntu armhf gcc), or MIPS (RTS3903N package). Also: musl's
 64-bit time_t breaks live555's `%ld` SDP printf — the build script
 sed-fixes it; the fifo EAGAIN fix lives in `tools/vendor/`.
 
-Nothing of the RTSP chain is persistent across reboots yet — see Phase 1.
+The chain is reboot-persistent: `hack/start-rtsp.sh` brings it up at every
+boot (spawned by `hack/boot.sh`). Restart it manually with
+`sh /tmp/sd/hack/start-rtsp.sh`.
 
 ## Backup
 

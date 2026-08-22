@@ -51,11 +51,21 @@ resort, not the next step.
   - mtd3 = raw ARM Image with an initramfs in an unidentified compression;
     extraction deferred (live rootfs is readable directly). `update.sh` not
     yet analyzed.
-- **Phase 1 — clean SD package:** one folder `/tmp/sd/hack/` with static
-  armv6 busybox, dropbear + keys, sftp-server, mediamtx, static curl, one
-  `boot.sh`, and a debug.sh one-liner. Build env: **WSL2 + musl.cc armhf
-  toolchain, `-march=armv6 -mfpu=vfp -mfloat-abi=hard -static`** (verified:
-  hello + fshare2fifo run on the camera).
+- **Phase 1 — clean SD package (DONE):** `/tmp/sd/hack/` on the SD card
+  holds the whole mod — `bin/` (static armv6 busybox 1.36.1 full applets,
+  dropbearmulti 2018.76 + persistent host key, fshare2fifo, rRTSPServer,
+  curl http-only), `root/.ssh/authorized_keys`, `boot.sh` (busybox into
+  /bin, telnetd 9999, dropbear 2222 via pidfile, spawns start-rtsp.sh) and
+  `start-rtsp.sh` (waits for the app's frame buffer, then producer → fifo →
+  server, idempotent). `debug.sh` on the SD root is now a one-liner exec'ing
+  boot.sh. Builds via `tools/build-busybox.sh` / `tools/build-curl.sh`
+  (WSL + musl.cc arm-linux-musleabi, soft-float static — see
+  `tools/build-armv6.sh`). Idempotency verified by double-running boot.sh
+  live; reboot persistence verified after a manual reboot.
+  **Deferred, with reasons:** mediamtx (LIVE555 works; a static Go armv6
+  binary would add ~10 MB to a 35 MB-RAM device — revisit only if HLS/
+  WebRTC is needed); sftp-server (dropbear has no sftp subsystem — `scp -O`
+  covers file transfer).
 - **Phase 2 — video out (DONE):** `src/fshare2fifo` (producer) →
   `/tmp/h264_high_fifo` → LIVE555 rRTSPServer (armv6 static musl build via
   `tools/build-armv6.sh`). **`rtsp://10.1.2.19/ch0_0.h264` streams the live
