@@ -38,14 +38,27 @@ resort, not the next step.
 
 ## Roadmap
 
-- **Phase 0 — read-only recon (current):** pull firmware artifacts to
-  `analysis/` (gitignored), unpack the RTS3903N tarball and mtd3's initramfs,
-  string-scan app binaries for RTSP/ONVIF leads, read `/backup/init.sh` and
-  `/home/app/script/update.sh`.
-- **Phase 1 — clean SD package:** one folder `/tmp/sd/hack/` with full-applet
-  static busybox, dropbear + keys, sftp-server, mediamtx, static curl, one
-  `boot.sh`, and a debug.sh one-liner. Build env: WSL2/Docker (Windows host).
-- **Phase 2 — video out:** via option 1 or 2.
+- **Phase 0 — read-only recon (DONE):** findings below.
+  - The `Yi-RTS3903N-RTSPServerV03` package is built for the **MIPS**
+    Realtek RTS3903N platform — its binaries can never run here. Its design
+    (grabber → fifo → LIVE555 RTSP) is the blueprint.
+  - All stock app binaries are ARM + uclibc; the yi-hack-v5 release
+    rRTSPServer is ARM glibc (VFPv3-only → SIGILL) or musl-armhf (ARMv7 →
+    SIGILL). Nothing prebuilt runs on this ARMv6+VFPv2 CPU; we must build.
+  - **The stock app exports the live H.264 stream via
+    `/dev/shm/fshare_frame_buf`** (1.7MB ring, frame counter at 0x18, NAL
+    chaining, named semaphores). This is the producer-side answer.
+  - mtd3 = raw ARM Image with an initramfs in an unidentified compression;
+    extraction deferred (live rootfs is readable directly). `update.sh` not
+    yet analyzed.
+- **Phase 1 — clean SD package:** one folder `/tmp/sd/hack/` with static
+  armv6 busybox, dropbear + keys, sftp-server, mediamtx, static curl, one
+  `boot.sh`, and a debug.sh one-liner. Build env: **WSL2 + musl.cc armhf
+  toolchain, `-march=armv6 -mfpu=vfp -mfloat-abi=hard -static`** (verified:
+  hello + fshare2fifo run on the camera).
+- **Phase 2 — video out (IN PROGRESS):** `src/fshare2fifo` (producer,
+  DONE + verified) → `/tmp/h264_high_fifo` → LIVE555 rRTSPServer (armv6
+  static build via `tools/build-rtspserver.sh`).
 - **Phase 3 — HA integration:** RTSP (generic camera) or ONVIF (minimal
   ws-discovery + SOAP service, or yi-hack's `wsd_simple_server` /
   `onvif_notify_server` if portable). PTZ does not need ONVIF: `pwmv2_fullhan`
@@ -55,8 +68,11 @@ resort, not the next step.
 
 ## Open questions
 
-- What exactly is `Yi-RTS3903N-RTSPServerV03.tar.gz`? (Phase 0)
-- Does `tserver`/`p2p_tnp` offer a local RTSP/RTP path? (Phase 0)
-- How does the official `update.sh` flash images — can that path be reused
-  safely? (Phase 0)
+- Does the app encrypt the h264 in the fshare buffer, or is the random
+  0x12C–0x46xx region unrelated? (our capture decodes as valid H.264, so
+  the stream region is cleartext)
 - Where are the UART pads for a uboot console? (before Phase 4)
+- How does the official `update.sh` flash images — can that path be reused
+  safely?
+- Semaphore protocol details for multi-reader fshare access (single reader
+  works by polling).
