@@ -61,10 +61,10 @@ resort, not the next step.
   boot.sh. Builds via `tools/build-busybox.sh` / `tools/build-curl.sh`
   (WSL + musl.cc arm-linux-musleabi, soft-float static — see
   `tools/build-armv6.sh`). Idempotency verified by double-running boot.sh
-  live. First reboot test: SSH/telnet came up fine, but the producer died
-  ("no H.264 stream found") because the frame buffer exists before the app
-  writes frames — fixed with a retry loop in start-rtsp.sh; final
-  confirmation pending a second manual reboot.
+  live. Reboot-tested twice: first reboot exposed that the frame buffer
+  exists before the app writes frames (producer died with "no H.264 stream
+  found") — fixed with a retry loop in start-rtsp.sh; second reboot came up
+  fully unattended (producer retried 3×, then stream decoded immediately).
   **Deferred, with reasons:** mediamtx (LIVE555 works; a static Go armv6
   binary would add ~10 MB to a 35 MB-RAM device — revisit only if HLS/
   WebRTC is needed); sftp-server (dropbear has no sftp subsystem — `scp -O`
