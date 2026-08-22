@@ -44,6 +44,12 @@
 
 #define BUFFER_FILE "/dev/shm/fshare_frame_buf"
 #define FRAME_COUNTER_OFFSET 0x18
+#define WRITE_HEAD_OFFSET 0x04      /* newest frame write position (u32) */
+/* Re-sync when the writer gets this close to our read position (the ring
+ * is about to lap us). We run a constant ~1 GOP behind the head by design
+ * (delivery is real-time paced), so "too far behind" is not itself an
+ * error - only the writer reaching us is. */
+#define RE_GATE_SAFETY (256u * 1024)
 #define DEFAULT_FIFO "/tmp/h264_high_fifo"
 #define SCAN_START 0x100          /* skip the small header */
 #define POLL_MS 10
@@ -286,6 +292,30 @@ static uint32_t frame_counter(void)
     return v;
 }
 
+/* The app's newest frame write position: a round-robin queue of the last
+ * three write positions at 0x04/0x0C/0x10 (each slot updates every third
+ * frame), so the head is the newest (max) of the three.
+ * Ring distance from pos to head (0..buf_size). */
+static uint32_t write_head(void)
+{
+    uint32_t v, h = 0;
+    unsigned off;
+    for (off = WRITE_HEAD_OFFSET; off <= WRITE_HEAD_OFFSET + 8; off += 4) {
+        memcpy(&v, (const void *)(buf + off), sizeof(v));
+        if (v < buf_size && v > h)
+            h = v;
+    }
+    return h;
+}
+
+static size_t dist_to_head(size_t pos)
+{
+    uint32_t h = write_head() % (uint32_t)buf_size;
+    if (h >= pos)
+        return h - pos;
+    return (size_t)h + buf_size - pos;
+}
+
 /* Write all n bytes to fd, looping over partial writes.
  * Returns 0 on success, -1 if the fd would block (fifo full), -2 on a
  * hard error. */
@@ -362,6 +392,7 @@ static int find_idr_start(size_t *out)
     size_t scanned = 0;
     size_t chain_sps = 0;
     size_t best = 0;
+    size_t best_dist = (size_t)-1;
     int found_chain = 0;
     int have_sps = 0;      /* 0: none, 1: SPS seen, 2: SPS+PPS seen */
 
@@ -396,8 +427,15 @@ static int find_idr_start(size_t *out)
             break;
         case 5:                       /* IDR completes the chain */
             if (want && have_sps == 2) {
-                best = chain_sps;
-                found_chain = 1;
+                /* prefer the chain nearest the app's write head: the
+                 * backlog to catch up stays small, so the writer cannot
+                 * lap and overwrite what we are about to emit */
+                size_t d = dist_to_head(chain_sps);
+                if (!found_chain || d < best_dist) {
+                    best = chain_sps;
+                    best_dist = d;
+                    found_chain = 1;
+                }
                 have_sps = 0;
             }
             break;
@@ -434,6 +472,12 @@ static int drain_round(size_t *pos, uint32_t *last, int force)
         e = s + 4;
         if (!next_sc(&e, 0) || e == s) /* no complete NAL yet */
             return 0;
+        /* we blocked on the fifo (or the reader is slow): if the app's
+         * write head is about to lap our read position, the bytes ahead
+         * are being overwritten - bail out so the caller re-syncs to a
+         * fresh chain */
+        if (!force && buf_size - dist_to_head(s) < RE_GATE_SAFETY)
+            return 1;
         if (want_nal(s, e)) {
             int r = emit_nal(s, e);
             if (r != 0)
@@ -465,15 +509,14 @@ static void drain_forever(void)
         last = c;
         r = drain_round(&pos, &last, 0);
         if (r == 1) {
-            /* The fifo backed up (no/frozen reader) and the ring has
-             * lapped our read position meanwhile. Emitting from a stale
-             * position serves overwritten bytes; jump to the newest
-             * chain instead. */
+            /* The writer is about to lap our read position (we stalled on
+             * the fifo and the bytes ahead are being overwritten) - jump
+             * to the newest chain. */
             if (find_idr_start(&pos)) {
                 last = frame_counter();
                 fprintf(stderr,
-                        "re-sync after fifo backpressure: IDR start at 0x%zX\n",
-                        pos);
+                        "re-sync: IDR start at 0x%zX (%zu bytes behind head)\n",
+                        pos, dist_to_head(pos));
             } else {
                 usleep(200 * 1000);
             }
@@ -540,17 +583,13 @@ int main(int argc, char **argv)
         /* unblock our writer-open in case no reader has connected yet */
         pthread_create(&unlock_thread, NULL, unlock_fifo_thread,
                        (void *)fifo_name);
-        /* Non-blocking writer: a full fifo (no or frozen reader) must not
-         * stall us - the ring would lap our read position while we block.
-         * Backpressure is handled in drain_forever by dropping the backlog
-         * and re-syncing to a fresh chain. Retry on ENXIO: the unlock
-         * thread's read-open may not have completed yet. */
-        for (i = 0; i < 20; i++) {
-            out_fd = open(fifo_name, O_WRONLY | O_NONBLOCK);
-            if (out_fd >= 0 || errno != ENXIO)
-                break;
-            usleep(100 * 1000);
-        }
+        /* Blocking writer: the fifo paces us to the reader (a client
+         * playing at real-time speed). While we block, the ring writer
+         * laps our read position; the head-distance check in drain_round
+         * detects that once we unblock and re-syncs to a fresh chain.
+         * The unlock thread's read-open keeps this open from blocking
+         * forever when no real reader exists. */
+        out_fd = open(fifo_name, O_WRONLY);
         if (out_fd < 0) {
             perror(fifo_name);
             return 1;
