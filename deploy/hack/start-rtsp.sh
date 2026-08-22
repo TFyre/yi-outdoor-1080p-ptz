@@ -28,10 +28,10 @@ PID=$(pidof fshare2fifo)
 [ -n "$PID" ] && kill $PID
 sleep 1
 
-# Server FIRST: it opens the still-empty fifo and waits for data. Its
-# startup drain discards whatever is already buffered in the fifo, so it
-# must open before the producer has written anything — otherwise it would
-# throw away the producer's IDR-gated clean stream head.
+# Server FIRST: it opens the fifo (blocking until the producer's write
+# open) and waits for data. Its startup drain keeps the tail from the
+# last SPS+PPS+IDR chain, so clients join at a keyframe even if the
+# producer has already written by the time the server starts.
 rm -f /tmp/h264_high_fifo
 mkfifo /tmp/h264_high_fifo
 nohup $BIN/rRTSPServer -a no >/tmp/rtsp.log 2>&1 &

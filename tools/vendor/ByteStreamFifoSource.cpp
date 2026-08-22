@@ -24,6 +24,8 @@ along with this library; if not, write to the Free Software Foundation, Inc.,
 #include "GroupsockHelper.hh"
 
 #include <fcntl.h>
+#include <string.h>
+#include <unistd.h>
 
 ////////// ByteStreamFifoSource //////////
 
@@ -34,9 +36,18 @@ ByteStreamFifoSource::createNew(UsageEnvironment& env, char const* fileName,
                                 unsigned preferredFrameSize,
                                 unsigned playTimePerFrame) {
     int flags;
-    unsigned char null[4];
     FILE* fid = OpenInputFile(env, fileName);
     if (fid == NULL) return NULL;
+
+    // Grow the fifo to 1 MB (kernel default 64 KB) so a whole GOP fits in
+    // the drain window below. Done here, with only this reader attached:
+    // F_SETPIPE_SZ fails with EEXIST once other handles are open (the
+    // producer's identical call on its write end fails for this reason and
+    // is ignored there).
+    (void)fcntl(fileno(fid), F_SETPIPE_SZ, 1024 * 1024);
+    if (debug & 4)
+        fprintf(stderr, "fifo pipe size: %d\n",
+                (int)fcntl(fileno(fid), F_GETPIPE_SZ));
 
     // Set non blocking
     if ((flags = fcntl(fileno(fid), F_GETFL, 0)) < 0) {
@@ -48,18 +59,85 @@ ByteStreamFifoSource::createNew(UsageEnvironment& env, char const* fileName,
         return NULL;
     };
 
-    // Clean fifo content
-    while (fread(null, 1, sizeof(null), fid) > 0) {}
+    // Drain stale fifo content, but KEEP the tail from the last complete
+    // SPS->PPS->IDR chain (fallback: last SPS). Blindly discarding
+    // everything makes the first client join mid-GOP: the producer's
+    // IDR-gated stream head gets thrown away whenever the server starts
+    // after the producer has begun writing. The kept tail is served
+    // before any further fifo reads, so joins decode from a keyframe.
+    // The producer sizes the fifo at 1 MB (F_SETPIPE_SZ) so a whole GOP
+    // fits in the drain window.
+    ByteStreamFifoSource* newSource = NULL;
+    {
+#define DRAIN_CAP (2048*1024)
+        unsigned char* drained = new unsigned char[DRAIN_CAP];
+        unsigned total = 0;
+        unsigned keep = 0, found = 0;
+        unsigned chain_sps = 0;
+        int attempt;
 
-    // Restore old blocking
-    if (fcntl(fileno(fid), F_SETFL, flags) != 0) {
-        fclose(fid);
-        return NULL;
-    };
+        /* Drain the fifo and keep the tail from the last complete
+         * SPS->PPS->IDR chain. If no chain is in the window (e.g. the
+         * DESCRIBE's dummy source drained the fifo moments ago), wait for
+         * the producer's next GOP (~2.4 s) instead of giving the client a
+         * mid-GOP join with a data gap. */
+        for (attempt = 0; attempt < 16; attempt++) {
+            while (total < DRAIN_CAP) {
+                size_t n = fread(drained + total, 1, DRAIN_CAP - total, fid);
+                if (n == 0) break;   /* fifo momentarily empty (EAGAIN) */
+                total += (unsigned)n;
+            }
 
-    ByteStreamFifoSource* newSource
-        = new ByteStreamFifoSource(env, fid, preferredFrameSize, playTimePerFrame);
+            /* scan for the last chain (SEI/AUD allowed inside). The
+             * producer emits 4-byte start codes (00 00 00 01); match those
+             * so the kept tail begins with a full code — LIVE555's framer
+             * only syncs on the 4-byte form. */
+            int have_sps = 0;        /* 0 none, 1 SPS, 2 SPS+PPS */
+            for (unsigned i = 0; i + 5 <= total; i++) {
+                if (drained[i] != 0 || drained[i+1] != 0 ||
+                    drained[i+2] != 0 || drained[i+3] != 1)
+                    continue;
+                unsigned t = drained[i+4] & 0x1F;
+                switch (t) {
+                case 7: chain_sps = i; have_sps = 1; keep = i; found = 1; break;
+                case 8: if (have_sps == 1) have_sps = 2; break;
+                case 5:
+                    if (have_sps == 2) { keep = chain_sps; found = 2; have_sps = 0; }
+                    break;
+                case 6: case 9: break;
+                default: have_sps = 0; break;
+                }
+            }
+            if (found == 2) break;
+            if (attempt < 15) {
+                /* no complete chain yet; give the producer a moment */
+                usleep(200000);
+            }
+        }
 
+        newSource
+            = new ByteStreamFifoSource(env, fid, preferredFrameSize, playTimePerFrame);
+        if (total > keep) {
+            newSource->fPendingData = new unsigned char[total - keep];
+            memcpy(newSource->fPendingData, drained + keep, total - keep);
+            newSource->fPendingLen = total - keep;
+            newSource->fPendingOff = 0;
+            if (debug & 4)
+                fprintf(stderr, "fifo drain: kept %u bytes from 0x%x (%s), head:"
+                        " %02x %02x %02x %02x %02x %02x\n",
+                        total - keep, keep,
+                        found == 2 ? "complete chain" :
+                        found == 1 ? "SPS only" : "mid-GOP (no chain in window)",
+                        newSource->fPendingData[0], newSource->fPendingData[1],
+                        newSource->fPendingData[2], newSource->fPendingData[3],
+                        newSource->fPendingData[4], newSource->fPendingData[5]);
+        }
+        delete[] drained;
+    }
+
+    // NOTE: the fd stays non-blocking on purpose; the constructor makes it
+    // non-blocking for the background-handler path anyway, and the fifo
+    // reader must never block (EAGAIN is handled in doReadFromFile).
     return newSource;
 }
 
@@ -79,13 +157,15 @@ ByteStreamFifoSource::ByteStreamFifoSource(UsageEnvironment& env, FILE* fid,
                                            unsigned playTimePerFrame)
     : FramedFileSource(env, fid), fFileSize(0), fPreferredFrameSize(preferredFrameSize),
       fPlayTimePerFrame(playTimePerFrame), fLastPlayTime(0),
-      fHaveStartedReading(False), fLimitNumBytesToStream(False), fNumBytesToStream(0) {
+      fHaveStartedReading(False), fLimitNumBytesToStream(False), fNumBytesToStream(0),
+      fPendingData(NULL), fPendingLen(0), fPendingOff(0) {
 #ifndef READ_FROM_FILES_SYNCHRONOUSLY
     makeSocketNonBlocking(fileno(fFid));
 #endif
 }
 
 ByteStreamFifoSource::~ByteStreamFifoSource() {
+    delete[] fPendingData;
     if (fFid == NULL) return;
 
 #ifndef READ_FROM_FILES_SYNCHRONOUSLY
@@ -104,6 +184,12 @@ void ByteStreamFifoSource::doGetNextFrame() {
 #ifdef READ_FROM_FILES_SYNCHRONOUSLY
     doReadFromFile();
 #else
+    if (fPendingOff < fPendingLen) {
+        // Kept drain tail still to serve: read it now instead of waiting
+        // for fifo activity (the fifo may well be empty at this point).
+        doReadFromFile();
+        return;
+    }
     if (!fHaveStartedReading) {
         // Await readable data from the file:
         envir().taskScheduler().setBackgroundHandling(fileno(fFid), SOCKET_READABLE,
@@ -130,39 +216,50 @@ void ByteStreamFifoSource::fileReadableHandler(ByteStreamFifoSource* source, int
 }
 
 void ByteStreamFifoSource::doReadFromFile() {
-    // Try to read as many bytes as will fit in the buffer provided (or "fPreferredFrameSize" if less)
-    if (fLimitNumBytesToStream && fNumBytesToStream < (u_int64_t)fMaxSize) {
-        fMaxSize = (unsigned)fNumBytesToStream;
-    }
-    if (fPreferredFrameSize > 0 && fPreferredFrameSize < fMaxSize) {
-        fMaxSize = fPreferredFrameSize;
-    }
+    // Serve the kept drain tail first (see createNew): it ends exactly
+    // where the fifo's current content begins, so the stream stays
+    // contiguous across the transition.
+    if (fPendingOff < fPendingLen) {
+        fFrameSize = fPendingLen - fPendingOff;
+        if (fFrameSize > fMaxSize) fFrameSize = fMaxSize;
+        memcpy(fTo, fPendingData + fPendingOff, fFrameSize);
+        fPendingOff += fFrameSize;
+    } else {
+        // Try to read as many bytes as will fit in the buffer provided (or "fPreferredFrameSize" if less)
+        if (fLimitNumBytesToStream && fNumBytesToStream < (u_int64_t)fMaxSize) {
+            fMaxSize = (unsigned)fNumBytesToStream;
+        }
+        if (fPreferredFrameSize > 0 && fPreferredFrameSize < fMaxSize) {
+            fMaxSize = fPreferredFrameSize;
+        }
 #ifdef READ_FROM_FILES_SYNCHRONOUSLY
-    fFrameSize = fread(fTo, 1, fMaxSize, fFid);
-    if (fFrameSize == 0) {
-        handleClosure();
-        return;
-    }
+        fFrameSize = fread(fTo, 1, fMaxSize, fFid);
+        if (fFrameSize == 0) {
+            handleClosure();
+            return;
+        }
 #else
-    {
-        /* The fifo is non-blocking: read() returns -1/EAGAIN when no frame
-         * is buffered yet. Treat that as "wait for the background handler"
-         * rather than converting it to a huge unsigned frame size (which
-         * made the H264 parser read 4GB and segfault). */
-        ssize_t n = read(fileno(fFid), fTo, fMaxSize);
-        if (n == 0) {
-            handleClosure();
-            return;
+        {
+            /* The fifo is non-blocking: read() returns -1/EAGAIN when no
+             * frame is buffered yet. Treat that as "wait for the
+             * background handler" rather than converting it to a huge
+             * unsigned frame size (which made the H264 parser read 4GB
+             * and segfault). */
+            ssize_t n = read(fileno(fFid), fTo, fMaxSize);
+            if (n == 0) {
+                handleClosure();
+                return;
+            }
+            if (n < 0) {
+                if (errno == EAGAIN || errno == EWOULDBLOCK)
+                    return;      /* background handler will re-trigger on data */
+                handleClosure();
+                return;
+            }
+            fFrameSize = (unsigned)n;
         }
-        if (n < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK)
-                return;      /* background handler will re-trigger on data */
-            handleClosure();
-            return;
-        }
-        fFrameSize = (unsigned)n;
-    }
 #endif
+    }
     fNumBytesToStream -= fFrameSize;
 
     // Set the 'presentation time':

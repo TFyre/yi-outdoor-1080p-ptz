@@ -181,9 +181,15 @@ static uint32_t frame_counter(void)
 }
 
 /* Forward frames from the ring while the producer keeps bumping the frame
- * counter. Called repeatedly; pos carries the read position across calls. */
+ * counter. Called repeatedly; pos carries the read position across calls.
+ *
+ * NAL start codes are written as 4-byte (00 00 00 01), not the ring's
+ * 3-byte form: LIVE555's H264 framer discards input until it sees a
+ * 4-byte code when syncing (the first NAL of a stream), which used to
+ * eat the SPS/PPS head. */
 static void drain_round(size_t *pos, uint32_t *last)
 {
+    static const unsigned char start4[4] = {0x00, 0x00, 0x00, 0x01};
     int i;
 
     for (i = 0; i < 64; i++) {
@@ -194,7 +200,9 @@ static void drain_round(size_t *pos, uint32_t *last)
         e = s + 3;
         if (!next_nal(&e) || e <= s) /* no complete frame yet */
             return;
-        if (fwrite(buf + s, e - s, 1, out) != 1)
+        if (fwrite(start4, 1, sizeof(start4), out) != sizeof(start4))
+            return;
+        if (fwrite(buf + s + 3, e - s - 3, 1, out) != 1)
             return;
         fflush(out);
         *pos = e;
@@ -280,6 +288,14 @@ int main(int argc, char **argv)
             perror(fifo_name);
             return 1;
         }
+        /* 1 MB fifo (kernel default is 64 KB) so a whole GOP fits in the
+         * buffered window the server's startup drain keeps to give new
+         * clients a decodable join point. Failure is not fatal. */
+        if (fcntl(fileno(out), F_SETPIPE_SZ, 1024 * 1024) != 0)
+            fprintf(stderr, "F_SETPIPE_SZ failed: %s (fifo stays 64 KB)\n",
+                    strerror(errno));
+        else
+            fprintf(stderr, "fifo pipe size set to 1 MB\n");
         out_is_fifo = 1;
     }
 
