@@ -72,15 +72,22 @@ resort, not the next step.
 - **Phase 2 — video out (DONE):** `src/fshare2fifo` (producer) →
   `/tmp/h264_high_fifo` → LIVE555 rRTSPServer (armv6 static musl build via
   `tools/build-armv6.sh`). **`rtsp://10.1.2.19/ch0_0.h264` streams the live
-  camera** (ffmpeg-verified). Clean joins implemented: SPS→PPS→IDR gate in
-  the producer + no-read unlock thread + server-before-producer start
-  order — fresh clients decode from frame one (verified: header errors
-  gone). **Remaining:** ~5 corrupt frames/s — forensics show the ring
-  interleaves video with ~31-byte-spaced table entries containing false
-  start codes (`00 00 01 c0` + size/timestamp-looking fields); the producer
-  emits those regions. Next: reverse the frame table (header write
-  positions at 0x04/0x0C look promising; samples in `analysis/fshare*.bin`)
-  and emit only true video frames.
+  camera** (ffmpeg-verified). Join quality hard-won, four stacked bugs:
+  (1) producer now waits for a complete SPS→PPS→IDR chain before emitting;
+  (2) emits **4-byte** start codes — LIVE555's framer discards input until
+  it sees `00 00 00 01`, and the ring's 3-byte form made it sync on
+  accidental alignments; (3) the server's startup drain now keeps the tail
+  from the last complete chain (1 MB fifo via server-side F_SETPIPE_SZ;
+  the producer's write-end call fails with EEXIST) and waits ~3 s for a
+  chain when the window has none; (4) the fifo unlock thread no longer
+  reads (it ate the first 1024 bytes = the stream head).
+  **Remaining:** ~1–2 errors/s steady + ~10 in the first 2 s of a join —
+  all traced to the ring's interleaved frame table (~31-byte-spaced
+  entries with false start codes like `00 00 01 c0` followed by
+  size/timestamp-looking fields). Next: reverse the table — the header's
+  0x04/0x0C fields look like ring write positions, and
+  `analysis/fshare*.bin` samples plus the Python NAL-scans are the seed
+  data — then emit only true video frames.
 - **Phase 3 — HA integration:** RTSP (generic camera) or ONVIF (minimal
   ws-discovery + SOAP service, or yi-hack's `wsd_simple_server` /
   `onvif_notify_server` if portable). PTZ does not need ONVIF: `pwmv2_fullhan`

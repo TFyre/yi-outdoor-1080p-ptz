@@ -100,16 +100,23 @@ boot (spawned by `hack/boot.sh`). Restart it manually with
 `sh /tmp/sd/hack/start-rtsp.sh`.
 
 **Join quality**: fshare2fifo waits for a complete SPS→PPS→IDR chain
-before emitting, and the fifo unlock thread must never `read()` from the
-fifo (an early version ate the first 1024 bytes = the SPS/PPS/IDR head).
-With those two + server-before-producer ordering, fresh client joins
-decode cleanly from frame one. Remaining corruption (~5 frames/s) is the
+before emitting, converts the ring's 3-byte NAL start codes to **4-byte**
+(LIVE555's framer discards input until it sees `00 00 00 01` and would
+otherwise sync on accidental alignments), and the fifo unlock thread must
+never `read()` from the fifo (an early version ate the first 1024 bytes =
+the stream head). The server side (vendored
+`tools/vendor/ByteStreamFifoSource.{hh,cpp}`) drains the fifo at open
+keeping the tail from the last complete chain, waits up to ~3 s for a
+chain, and grows the fifo to 1 MB via F_SETPIPE_SZ on its own read end
+(the producer's write-end call fails with EEXIST once other handles are
+open). Remaining corruption (~1–2/s steady + a few at join) is the
 **frame table** problem: the ring interleaves the H.264 stream with
 ~31-byte-spaced table entries full of false start codes (`00 00 01 c0`
 followed by size/timestamp-looking fields) — fshare2fifo's NAL walk emits
-those regions as stream data. The table (write positions in the header,
-entry layout) is not yet reverse-engineered; that's the next task, and
-`analysis/fshare*.bin` samples + a Python NAL-scan are the starting data.
+those regions as stream data. The table (write positions in the header at
+0x04/0x0C, entry layout) is not yet reverse-engineered; that's the next
+task, and `analysis/fshare*.bin` samples + a Python NAL-scan are the
+starting data.
 
 ## Backup
 
