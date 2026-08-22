@@ -34,6 +34,9 @@ mkdir -p /root/.ssh
 cat $HACK/root/.ssh/authorized_keys > /root/.ssh/authorized_keys
 chmod 700 /root/.ssh
 chmod 600 /root/.ssh/authorized_keys
+# dropbearmulti applets in PATH: client-side scp -O execs a remote `scp -t`
+ln -sf $BIN/dropbearmulti /bin/scp
+ln -sf $BIN/dropbearmulti /bin/dbclient
 # Start only if no pidfile-tracked instance is alive (idempotent re-run).
 # Killing an existing listener is deliberately avoided: its child sessions
 # share its comm name, so a pidof-based kill would take down live SSH

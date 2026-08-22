@@ -6,6 +6,10 @@
  * the shared buffer and bumps a frame counter at offset 0x18. This tool
  * watches the counter and forwards new frames as they are written.
  *
+ * Before forwarding anything it waits for a complete SPS->PPS->IDR chain
+ * in the ring, so clients joining the stream decode a clean picture from
+ * their very first frame instead of mid-GOP artifacts.
+ *
  * Buffer layout (reverse-engineered on the FH8626V100, fw 5.0.00.00):
  *   0x00-0x3F   small header; u32 frame counter at 0x18
  *   ~0x46xx..   H.264 stream ring, wraps at the end of the buffer.
@@ -50,14 +54,20 @@ static FILE *out;
 static int out_is_fifo;
 
 /* Keep the fifo open for writing without blocking forever when no reader
- * has appeared yet: a helper thread opens it read-only to unblock us. */
+ * has appeared yet: a helper thread opens it read-only to unblock us, then
+ * parks with the fd open (a fifo writer with no reader gets EPIPE).
+ *
+ * NOTE: it must never read() from the fifo — an early version did and
+ * silently stole the first 1024 bytes of the stream (the SPS+PPS+IDR
+ * head), which made every client join mid-GOP. */
 static void *unlock_fifo_thread(void *arg)
 {
     const char *fifo_name = arg;
-    char dummy[1024];
     int fd = open(fifo_name, O_RDONLY);
-    if (fd >= 0)
-        read(fd, dummy, sizeof(dummy));
+    if (fd >= 0) {
+        while (1)
+            pause();               /* hold the fd open; never consume data */
+    }
     return NULL;
 }
 
@@ -98,6 +108,69 @@ static int next_nal(size_t *pos)
         scanned++;
     }
     return 0;
+}
+
+/* Find a decodable start point: the most recent complete SPS->PPS->IDR
+ * chain in the ring. Emitting from anywhere else means clients join
+ * mid-GOP and show decoder artifacts until the next keyframe; starting
+ * at the SPS of a complete chain gives every new client a clean picture
+ * from its first frame. SEI/AUD NALs may appear inside the chain.
+ * Returns 1 and sets *out, or 0 if no complete chain is in the ring. */
+static int find_idr_start(size_t *out)
+{
+    size_t p = SCAN_START;
+    size_t scanned = 0;
+    size_t sps_pos = 0;
+    size_t best = 0;
+    int found_chain = 0;
+    int have_sps = 0;      /* 0: none, 1: SPS seen, 2: SPS+PPS seen */
+
+    while (scanned < buf_size) {
+        int found = 0;
+        while (scanned < buf_size) {          /* next start code, wrapping */
+            if (p + 4 > buf_size)
+                p = 0;
+            if (p + 4 <= buf_size &&
+                buf[p] == 0x00 && buf[p + 1] == 0x00 && buf[p + 2] == 0x01 &&
+                is_nal_type(buf[p + 3])) {
+                found = 1;
+                break;
+            }
+            p++;
+            scanned++;
+        }
+        if (!found)
+            break;
+
+        switch (buf[p + 3] & 0x1F) {
+        case 7:                             /* SPS restarts the chain */
+            sps_pos = p;
+            have_sps = 1;
+            break;
+        case 8:                             /* PPS follows the SPS */
+            if (have_sps == 1)
+                have_sps = 2;
+            break;
+        case 5:                             /* IDR completes the chain */
+            if (have_sps == 2) {
+                best = sps_pos;
+                found_chain = 1;
+                have_sps = 0;
+            }
+            break;
+        case 6: case 9:                     /* SEI/AUD: legal inside */
+            break;
+        default:                            /* anything else breaks it */
+            have_sps = 0;
+            break;
+        }
+        p += 4;
+        scanned += 4;
+    }
+    if (!found_chain)
+        return 0;
+    *out = best;
+    return 1;
 }
 
 static uint32_t frame_counter(void)
@@ -153,6 +226,7 @@ int main(int argc, char **argv)
     const char *out_file = NULL;
     int opt;
     int fd;
+    int i;
     pthread_t unlock_thread;
     struct stat st;
 
@@ -184,15 +258,8 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    /* locate the stream base: first NAL after the header */
-    stream_base = SCAN_START;
-    if (!next_nal(&stream_base)) {
-        fprintf(stderr, "no H.264 stream found in %s\n", BUFFER_FILE);
-        return 1;
-    }
-    fprintf(stderr, "stream base at 0x%zX, buffer %zu bytes\n",
-            stream_base, buf_size);
-
+    /* The fifo is opened before the start-point wait below, so a server
+     * can attach immediately and just see no bytes until the gate passes. */
     if (out_file) {
         out = fopen(out_file, "wb");
         if (!out) {
@@ -215,6 +282,26 @@ int main(int argc, char **argv)
         }
         out_is_fifo = 1;
     }
+
+    /* Wait for a decodable start point: a complete SPS->PPS->IDR chain.
+     * Emitting from anywhere else means every client joins mid-GOP and
+     * shows decoder artifacts until the next keyframe. The ring holds
+     * ~1.7 MB (several seconds of video), so once the app is writing, a
+     * chain appears within one GOP interval; give it up to ~30 s. */
+    stream_base = SCAN_START;
+    for (i = 0; !find_idr_start(&stream_base); i++) {
+        if (i == 0)
+            fprintf(stderr, "waiting for SPS/PPS/IDR chain...");
+        if (i >= 600) {
+            fprintf(stderr, " none found in %s\n", BUFFER_FILE);
+            fclose(out);
+            munmap((void *)buf, buf_size);
+            return 1;
+        }
+        usleep(50 * 1000);
+    }
+    fprintf(stderr, "IDR start at 0x%zX, buffer %zu bytes\n",
+            stream_base, buf_size);
 
     drain_forever();
 

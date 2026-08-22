@@ -7,7 +7,7 @@
 set -e
 
 REPO=/mnt/c/myprogs/yi-outdoor-1080p-ptz
-VER=1.36.1
+VER=1.38.0
 SRCDIR=$HOME/build-armv6/src
 TC=$HOME/musl-tc/arm-linux-musleabi-cross
 CROSS=$TC/bin/arm-linux-musleabi

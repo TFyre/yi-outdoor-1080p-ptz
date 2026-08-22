@@ -7,7 +7,7 @@
 set -e
 
 REPO=/mnt/c/myprogs/yi-outdoor-1080p-ptz
-VER=8.4.0
+VER=8.21.0
 SRCDIR=$HOME/build-armv6/src
 TC=$HOME/musl-tc/arm-linux-musleabi-cross
 CROSS=$TC/bin/arm-linux-musleabi
@@ -18,6 +18,11 @@ cd "$SRCDIR"
 cd curl-$VER
 
 export PATH="$TC/bin:$PATH"
+# curl links via libtool, which drops plain -static; -all-static is the
+# libtool flag that produces a fully static executable. But configure's
+# own test programs are linked with gcc directly, which rejects
+# -all-static — so configure gets plain -static and only the final curl
+# link (curl_LDFLAGS) gets -all-static.
 ./configure \
   --host=arm-linux-musleabi \
   CC="$CROSS-gcc" AR="$CROSS-ar" RANLIB="$CROSS-ranlib" \
@@ -33,8 +38,17 @@ export PATH="$TC/bin:$PATH"
   >/dev/null
 
 make -j"$(nproc)" -C lib >/dev/null
-make -C src curl_LDFLAGS="-static" >/dev/null
+# force a relink: make cannot see curl_LDFLAGS changes as a dependency
+rm -f src/curl src/.libs/curl
+make -C src curl_LDFLAGS="-all-static" >/dev/null
 "$CROSS-strip" src/curl
+
+# -all-static must have produced a truly static binary (no PT_INTERP);
+# the camera has no musl dynamic loader at all.
+if "$CROSS-readelf" -l src/curl | grep -q INTERP; then
+    echo "FAIL: curl is still dynamically linked" >&2
+    exit 1
+fi
 
 # Same ARMv6/VFPv2 purity scan as build-armv6.sh
 n=$(arm-linux-gnueabihf-objdump -d src/curl \
