@@ -50,19 +50,22 @@ The whole mod lives on the SD card; stock flash stays untouched. `debug.sh`
 on the SD root is a one-liner that execs `hack/boot.sh` at every boot.
 
 - `hack/boot.sh` — orchestrator (idempotent, fast): installs the static
-  busybox 1.36.1 (full applets) into `/bin` (ramdisk, redone each boot),
-  starts telnetd 9999 + dropbear 2222 (pidfile-guarded), spawns
-  `start-rtsp.sh` detached (the stock boot may wait for debug.sh to return).
+  busybox (full applets) into `/bin` (ramdisk, redone each boot), starts
+  telnetd 9999 + dropbear 2222 (pidfile-guarded), creates the
+  dropbearmulti applet symlinks `/bin/scp` and `/bin/dbclient` (client-side
+  `scp -O` execs a remote `scp -t`, which must resolve to something), then
+  spawns `start-rtsp.sh` detached (the stock boot may wait for debug.sh to
+  return).
 - `hack/start-rtsp.sh` — waits for `/dev/shm/fshare_frame_buf` (the app
-  creates it once the camera pipeline is up), then starts
-  `fshare2fifo` → `/tmp/h264_high_fifo` → `rRTSPServer -a no` (port 554),
-  killing previous instances first (idempotent). Limitation: if rmm
-  restarts mid-uptime and recreates its buffer, the producer's mmap goes
-  stale — re-run the script or reboot.
+  creates it once the camera pipeline is up), then starts the chain in
+  this order: **rRTSPServer first** (its startup drain discards buffered
+  fifo content, so it must open the fifo before the producer writes), then
+  **fshare2fifo** (retried until it survives). Idempotent. Limitation: if
+  rmm restarts mid-uptime and recreates its buffer, the producer's mmap
+  goes stale — re-run the script or reboot.
 - `hack/bin/` — binaries, all static armv6 (gitignored, rebuilt with
-  `tools/build-*.sh` in WSL): busybox 1.36.1, curl 8.4 (http-only, no TLS),
-  dropbearmulti 2018.76 (from the yi-hack 0.4.1 release; the source-adjacent
-  dropbear in that release is not rebuilt here), fshare2fifo, rRTSPServer.
+  `tools/build-*.sh` in WSL): busybox 1.38.0, curl 8.21.0 (http-only, no
+  TLS), dropbearmulti 2026.94 (built from source), fshare2fifo, rRTSPServer.
 - `hack/root/.ssh/authorized_keys` — pubkeys boot.sh installs to
   `/root/.ssh/` each boot (the ramdisk resets).
 - `hack/etc/dropbear/ecdsa.key` — host key (gitignored; boot.sh regenerates
@@ -95,6 +98,18 @@ sed-fixes it; the fifo EAGAIN fix lives in `tools/vendor/`.
 The chain is reboot-persistent: `hack/start-rtsp.sh` brings it up at every
 boot (spawned by `hack/boot.sh`). Restart it manually with
 `sh /tmp/sd/hack/start-rtsp.sh`.
+
+**Join quality**: fshare2fifo waits for a complete SPS→PPS→IDR chain
+before emitting, and the fifo unlock thread must never `read()` from the
+fifo (an early version ate the first 1024 bytes = the SPS/PPS/IDR head).
+With those two + server-before-producer ordering, fresh client joins
+decode cleanly from frame one. Remaining corruption (~5 frames/s) is the
+**frame table** problem: the ring interleaves the H.264 stream with
+~31-byte-spaced table entries full of false start codes (`00 00 01 c0`
+followed by size/timestamp-looking fields) — fshare2fifo's NAL walk emits
+those regions as stream data. The table (write positions in the header,
+entry layout) is not yet reverse-engineered; that's the next task, and
+`analysis/fshare*.bin` samples + a Python NAL-scan are the starting data.
 
 ## Backup
 

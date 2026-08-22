@@ -72,9 +72,15 @@ resort, not the next step.
 - **Phase 2 — video out (DONE):** `src/fshare2fifo` (producer) →
   `/tmp/h264_high_fifo` → LIVE555 rRTSPServer (armv6 static musl build via
   `tools/build-armv6.sh`). **`rtsp://10.1.2.19/ch0_0.h264` streams the live
-  camera** (ffmpeg-verified). Known issues: join starts mid-GOP (decoder
-  artifacts until first IDR), occasional torn frames at ring wrap —
-  polish by waiting for SPS/IDR before emitting.
+  camera** (ffmpeg-verified). Clean joins implemented: SPS→PPS→IDR gate in
+  the producer + no-read unlock thread + server-before-producer start
+  order — fresh clients decode from frame one (verified: header errors
+  gone). **Remaining:** ~5 corrupt frames/s — forensics show the ring
+  interleaves video with ~31-byte-spaced table entries containing false
+  start codes (`00 00 01 c0` + size/timestamp-looking fields); the producer
+  emits those regions. Next: reverse the frame table (header write
+  positions at 0x04/0x0C look promising; samples in `analysis/fshare*.bin`)
+  and emit only true video frames.
 - **Phase 3 — HA integration:** RTSP (generic camera) or ONVIF (minimal
   ws-discovery + SOAP service, or yi-hack's `wsd_simple_server` /
   `onvif_notify_server` if portable). PTZ does not need ONVIF: `pwmv2_fullhan`
