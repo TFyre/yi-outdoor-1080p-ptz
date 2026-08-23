@@ -118,6 +118,7 @@ static size_t buf_size;
 static size_t stream_base;         /* first emitted NAL position in the ring */
 static FILE *out;                  /* file output (-o FILE) */
 static int out_fd = -1;            /* fifo output, blocking */
+static size_t g_pipe_size = 256 * 1024; /* fifo capacity (F_GETPIPE_SZ) */
 
 /* Resolution filtering: emit only the largest stream seen so far. */
 static unsigned target_w, target_h;   /* dims of the stream being emitted */
@@ -723,37 +724,41 @@ static int write_all_fd_wait(int fd, const void *p, size_t n)
     return 0;
 }
 
-/* Write all n bytes to fd, looping over partial writes. A full fifo
- * retries for up to ~10 ms before giving up: equal-rate pacing (the
- * client plays at wall-clock speed, the walk writes at the writer's
- * speed) fills the fifo TRANSIENTLY all the time, and those absorb as
- * micro-stalls instead of dropping a NAL (a dropped NAL is a concealed
- * frame). Only a REAL stall returns -1, which drops the NAL and keeps
- * the walk glued to the writer. The budget must stay small: with no
- * client every NAL burns it, and a long budget makes the walk's
- * rounds crawl far behind the writer.
- * Returns 0 on success, -1 (fifo full past the retry budget), or -2
- * on a hard error. */
-static int write_all_fd_pace(int fd, const void *p, size_t n)
+/* Whole-or-drop write for SLICE NALs: a partial NAL left in the fifo
+ * is worse than a dropped one - the client's stream then carries a
+ * truncated slice whose start code is missing, the decoder conceals
+ * the whole frame (the motion-run "error while decoding MB 51 0,
+ * bytestream 1722" storms), and the orphaned bytes push the following
+ * NAL out of sync. Check the fifo's free space FIRST and either write
+ * the entire NAL in one write() (a pipe write of n bytes with at
+ * least n free writes exactly n) or drop it with NOTHING written.
+ * The chain NALs keep the wait path above: a dropped keyframe freezes
+ * every client.
+ * Returns 0 on success, -1 (would not fit: dropped whole), or -2 on
+ * a hard error. */
+static int write_whole_fd(int fd, const void *p, size_t n)
 {
-    const uint8_t *b = p;
-    int tries = 0;
-    while (n > 0) {
-        ssize_t w = write(fd, b, n);
-        if (w < 0) {
-            if ((errno == EAGAIN || errno == EWOULDBLOCK) &&
-                tries < 5) {
-                tries++;
-                usleep(2000);
-                continue;
-            }
-            return (errno == EAGAIN || errno == EWOULDBLOCK) ? -1 : -2;
-        }
-        tries = 0;
-        b += w;
-        n -= (size_t)w;
+    int fill = 0;
+    ssize_t w;
+
+    if (ioctl(fd, FIONREAD, &fill) == 0 &&
+        (size_t)fill + n > g_pipe_size)
+        return -1;                    /* does not fit now: drop whole */
+
+    /* Between the check and the write the fifo can only gain space
+     * (this process is the only writer; readers only drain), so the
+     * write below completes in full. If the kernel cuts it short
+     * anyway (pipe accounting edge), completing the rest on the wait
+     * path beats leaking another partial NAL. */
+    w = write(fd, p, n);
+    if (w == (ssize_t)n)
+        return 0;
+    if (w < 0) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK)
+            return -1;
+        return -2;
     }
-    return 0;
+    return write_all_fd_wait(fd, (const uint8_t *)p + w, n - (size_t)w);
 }
 
 /* A complete NAL is copied out of the ring BEFORE the (potentially
@@ -764,7 +769,7 @@ static int write_all_fd_pace(int fd, const void *p, size_t n)
  * copy also lets the lap check run only after the NAL is complete, so
  * a re-sync never abandons a half-written NAL either. */
 #define NAL_COPY_MAX (192u * 1024)
-static uint8_t nal_copy[NAL_COPY_MAX];
+static uint8_t nal_copy[NAL_COPY_MAX + 4];  /* + 4-byte start code prefix */
 
 /* Emit one NAL (ring positions s..e) as 4-byte start code + body,
  * handling the ring wrap. Returns 0, -1 (would block), or -2 (error).
@@ -785,28 +790,23 @@ static int emit_nal(size_t s, size_t e)
         size_t len = (e > s) ? (e - s - 3) : (buf_size - s - 3 + e);
         int r;
 
-        if (len > sizeof(nal_copy))
+        if (len > NAL_COPY_MAX)
             return -2;                /* implausibly large NAL */
-        len = copy_nal(s, e, nal_copy, sizeof(nal_copy));
+        len = copy_nal(s, e, nal_copy + 4, NAL_COPY_MAX);
         if (len == 0)
             return -2;
-        /* Chain NALs (SPS/PPS/IDR) wait for fifo space - see
-         * write_all_fd_wait; slices use the paced writer and may be
-         * dropped on a real stall. */
+        /* Start code + body as ONE buffer so slices go out in a single
+         * whole-or-drop write (write_whole_fd); chains (SPS/PPS/IDR)
+         * wait for fifo space - see write_all_fd_wait. */
+        memcpy(nal_copy, start4, sizeof(start4));
         if ((buf[s + 3] & 0x1F) == 5 ||
             (buf[s + 3] & 0x1F) == 7 ||
             (buf[s + 3] & 0x1F) == 8) {
-            r = write_all_fd_wait(out_fd, start4, sizeof(start4));
-            if (r != 0)
-                return r;
-            r = write_all_fd_wait(out_fd, nal_copy, len);
+            r = write_all_fd_wait(out_fd, nal_copy, len + 4);
             if (r != 0)
                 return r;
         } else {
-            r = write_all_fd_pace(out_fd, start4, sizeof(start4));
-            if (r != 0)
-                return r;
-            r = write_all_fd_pace(out_fd, nal_copy, len);
+            r = write_whole_fd(out_fd, nal_copy, len + 4);
             if (r != 0)
                 return r;
         }
@@ -1188,6 +1188,9 @@ int main(int argc, char **argv)
             else
                 fprintf(stderr, "F_SETPIPE_SZ ok: %d\n",
                         fcntl(out_fd, F_GETPIPE_SZ));
+            cur = fcntl(out_fd, F_GETPIPE_SZ);
+            if (cur > 0)
+                g_pipe_size = (size_t)cur;   /* the whole-or-drop budget */
         }
     }
 
