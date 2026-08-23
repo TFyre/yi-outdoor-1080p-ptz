@@ -463,46 +463,42 @@ static int write_all_fd(int fd, const void *p, size_t n)
     return 0;
 }
 
-/* Write n bytes, watching the frame counter across the call: if the
- * write blocked long enough for the writer to overwrite our read
- * position, report -3 so the caller re-syncs to a fresh chain. */
-static int write_all_fd_lap(int fd, const void *p, size_t n)
-{
-    uint32_t c0 = frame_counter();
-    int r = write_all_fd(fd, p, n);
-    if (r != 0)
-        return r;
-    if (frame_counter() - c0 >= LAP_TICKS)
-        return -3;
-    return 0;
-}
+/* A complete NAL is copied out of the ring BEFORE the (potentially
+ * blocking) fifo write: while we are blocked, the writer laps the ring
+ * and would overwrite the bytes mid-write, truncating e.g. a 130 KB
+ * IDR - one truncated keyframe breaks every dependent P frame until
+ * the next clean one (full-frame conceal storms). Writing a private
+ * copy also lets the lap check run only after the NAL is complete, so
+ * a re-sync never abandons a half-written NAL either. */
+#define NAL_COPY_MAX (192u * 1024)
+static uint8_t nal_copy[NAL_COPY_MAX];
 
 /* Emit one NAL (ring positions s..e) as 4-byte start code + body,
  * handling the ring wrap. Returns 0, -1 (would block), -2 (error), or
- * -3 (lapped while blocked). */
+ * -3 (the fifo blocked us long enough that the writer overwrote our
+ * read position: re-sync to a fresh chain). */
 static int emit_nal(size_t s, size_t e)
 {
     static const unsigned char start4[4] = {0x00, 0x00, 0x00, 0x01};
 
     if (out_fd >= 0) {
-        int r = write_all_fd_lap(out_fd, start4, sizeof(start4));
+        uint32_t c0 = frame_counter();
+        size_t len = (e > s) ? (e - s - 3) : (buf_size - s - 3 + e);
+        int r;
+
+        if (len > sizeof(nal_copy))
+            return -2;                /* implausibly large NAL */
+        len = copy_nal(s, e, nal_copy, sizeof(nal_copy));
+        if (len == 0)
+            return -2;
+        r = write_all_fd(out_fd, start4, sizeof(start4));
         if (r != 0)
             return r;
-        if (e > s) {
-            r = write_all_fd_lap(out_fd, (const void *)(buf + s + 3), e - s - 3);
-            if (r != 0)
-                return r;
-        } else {                  /* NAL spans the ring wrap */
-            r = write_all_fd_lap(out_fd, (const void *)(buf + s + 3),
-                                 buf_size - s - 3);
-            if (r != 0)
-                return r;
-            if (e > 0) {
-                r = write_all_fd_lap(out_fd, (const void *)buf, e);
-                if (r != 0)
-                    return r;
-            }
-        }
+        r = write_all_fd(out_fd, nal_copy, len);
+        if (r != 0)
+            return r;
+        if (frame_counter() - c0 >= LAP_TICKS)
+            return -3;                /* the NAL is complete; re-sync now */
         return 0;
     }
 
