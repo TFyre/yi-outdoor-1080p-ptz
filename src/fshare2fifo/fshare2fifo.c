@@ -697,6 +697,32 @@ static size_t dist_to_head_cached(size_t pos, uint32_t head)
     return (size_t)h + buf_size - pos;
 }
 
+/* Blocking write for CHAIN NALs (SPS/PPS/IDR): the paced writer's
+ * ~10 ms grace hits the biggest NALs hardest - an IDR keyframe
+ * (~100 KB) cannot squeeze into a full fifo within the budget, and a
+ * dropped keyframe freezes every client until the next GOP (the
+ * observed "runs ~7 s then stops getting new frames": a few GOPs of
+ * connect-time slack, then every chain drops). Chains therefore WAIT
+ * for space instead of dropping; the purger thread guarantees progress
+ * even with no client (it trims the fifo's tail every 250 ms). */
+static int write_all_fd_wait(int fd, const void *p, size_t n)
+{
+    const uint8_t *b = p;
+    while (n > 0) {
+        ssize_t w = write(fd, b, n);
+        if (w < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                usleep(2000);
+                continue;
+            }
+            return -2;
+        }
+        b += w;
+        n -= (size_t)w;
+    }
+    return 0;
+}
+
 /* Write all n bytes to fd, looping over partial writes. A full fifo
  * retries for up to ~10 ms before giving up: equal-rate pacing (the
  * client plays at wall-clock speed, the walk writes at the writer's
@@ -764,12 +790,26 @@ static int emit_nal(size_t s, size_t e)
         len = copy_nal(s, e, nal_copy, sizeof(nal_copy));
         if (len == 0)
             return -2;
-        r = write_all_fd_pace(out_fd, start4, sizeof(start4));
-        if (r != 0)
-            return r;
-        r = write_all_fd_pace(out_fd, nal_copy, len);
-        if (r != 0)
-            return r;
+        /* Chain NALs (SPS/PPS/IDR) wait for fifo space - see
+         * write_all_fd_wait; slices use the paced writer and may be
+         * dropped on a real stall. */
+        if ((buf[s + 3] & 0x1F) == 5 ||
+            (buf[s + 3] & 0x1F) == 7 ||
+            (buf[s + 3] & 0x1F) == 8) {
+            r = write_all_fd_wait(out_fd, start4, sizeof(start4));
+            if (r != 0)
+                return r;
+            r = write_all_fd_wait(out_fd, nal_copy, len);
+            if (r != 0)
+                return r;
+        } else {
+            r = write_all_fd_pace(out_fd, start4, sizeof(start4));
+            if (r != 0)
+                return r;
+            r = write_all_fd_pace(out_fd, nal_copy, len);
+            if (r != 0)
+                return r;
+        }
         if (f2f_agelog()) {
             uint32_t c1 = frame_counter();
             g_nals++;
