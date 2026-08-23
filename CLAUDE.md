@@ -107,9 +107,27 @@ never `read()` from the fifo (an early version ate the first 1024 bytes =
 the stream head). The server side (vendored
 `tools/vendor/ByteStreamFifoSource.{hh,cpp}`) drains the fifo at open
 keeping the tail from the last complete chain, waits up to ~3 s for a
-chain, and grows the fifo to 1 MB via F_SETPIPE_SZ on its own read end
+chain, and grows the fifo to 256 KB via F_SETPIPE_SZ on its own read end
 (the producer's write-end call fails with EEXIST once other handles are
 open).
+
+**The walk (commit 9382405, replaces all earlier pacing)**: the producer
+does NOT chase the frame counter (a ~45/s heartbeat, not a position) and
+does NOT use a fixed byte gap (bitrate-blind: 192 KB ≈ 27 s of content at
+an ultra-static ~7 KB/s scene — the observed 13 s latency). It emits a
+NAL only when its END lies ≥ NAL length + 128 B before the writer's
+position signal — provably complete, ~one frame old at ANY bitrate. The
+writer's position comes from a 250 ms ring-diff sampler (shadow copy +
+memcmp; the top of the newest changed run IS the write head in every
+ring mode); the c0-checkpoint forward scan and the header slots
+(0x04/0x08/0x0C/0x10, jitter-clamped) are the seed/fallback. A join (or
+a MAX_LAG escape after a client stall) emits the newest chain then jumps
+to just behind the head — the mid-GOP backlog is dropped, because the
+fifo drains at the writer's own rate and a backlog can never be closed
+by sprinting it (measured: sprint → lag equilibrium). There is no
+time-based lap re-sync — it fired on sprint blocks and looped forever
+(sprint → block ≥1.1 s → re-sync → sprint). Per-second diagnostics:
+`F2F_AGELOG=1` logs pos/head/dist/emission/block stats.
 
 **Ring format (reverse-engineered from live captures, commit 1677010)**:
 the ring carries TWO interleaved H.264 streams — the target 1920×1088
@@ -129,8 +147,11 @@ at ~440 KB/s; positional re-gates churn against that). Measured live:
 1080p — was full-frame concealment on nearly every P frame. Forensics
 base: `analysis/s*.bin` snapshots, `tools/ringdiff.py`. Note the ring
 format has MODES: transient boot-time record streams (26/34-byte headers
-with `6a 8a 33 f?` magics) and the steady-state raw Annex-B mode above;
-the current producer handles the steady state.
+with `6a 8a 33 f?` magics) and the steady-state raw Annex-B mode above.
+The modes ALSO change mid-uptime: verified live that the c0 entries
+vanish while the encoder keeps running, and the header slots freeze when
+the writer reaches the buffer end — the ring-diff sampler in the
+producer tracks the writer through all of it.
 
 ## Backup
 

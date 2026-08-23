@@ -97,12 +97,36 @@ resort, not the next step.
      era-dependent and unusable as discriminators. ffplay 60 s:
      0 errors, 0 conceals.
   2. Lap-detection false positives under pacing: the server drains the
-     1 MB fifo in ~2.3 s bursts, so every normal block tripped the
-     1.2 s lap threshold → re-sync storm → the accumulating delay.
-     Threshold raised to ~3 s (LAP_TICKS 130).
+     fifo in bursts, so every normal block tripped the 1.2 s lap
+     threshold → re-sync storm → the accumulating delay.
   3. The stream structure is era/mode-dependent (boot-time record
      streams with 26/34-byte headers and `6a 8a 33 f?` magics vs the
-     steady-state raw Annex-B mode; P/B splits that vary per session).
+     steady-state raw Annex-B mode; P/B splits that vary per session),
+     and the modes change MID-UPTIME (c0 entries vanish, header slots
+     freeze at the buffer end).
+
+  **The 13 s latency, root-caused and fixed (commit 9382405).** Three
+  stacked producer bugs, measured with a per-second age log
+  (`F2F_AGELOG=1`):
+  1. *Wrap-walk*: the "caught up with the writer" check compared the
+     frame counter — a ~45/s heartbeat, not a position — so the walk
+     ran past the head, wrapped the ring, and re-emitted the oldest
+     content (age swings 0..17 s; the user's "realtime frame flashes
+     then disappears" was the walk crossing the head).
+  2. *Bitrate-blind gap*: the 192 KB positional gate is ~0.4 s of
+     content at motion but ~27 s at an ultra-static ~7 KB/s scene (the
+     observed 13 s). Fixed: emit a NAL only when its END lies ≥ its own
+     length + 128 B before the writer's position signal — provably
+     complete, ~one frame old at ANY bitrate.
+  3. *Dead position signals*: a 250 ms ring-diff sampler (shadow copy +
+     memcmp) now yields the writer's position in every mode; c0/slots
+     are the seed/fallback.
+  Also: joins drop the un-closable mid-GOP backlog (emit the chain,
+  then jump to the gate line — the fifo drains at the writer's own
+  rate, so a sprint never catches up), the time-based lap re-sync was
+  removed (it fired on sprint blocks and looped forever), and MAX_LAG
+  re-joins handle genuine escapes. Verified live: walk hugs the writer
+  at 129–2937 B for minutes, zero decode errors, client stays up.
 
   **Upstream code found (2026-08, user-supplied links) — the same fshare
   design across YI platforms:**
