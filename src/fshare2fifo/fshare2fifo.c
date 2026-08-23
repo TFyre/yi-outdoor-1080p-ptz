@@ -36,11 +36,22 @@
  * artifacts. NAL start codes are written as 4-byte (00 00 00 01) - the
  * ring uses 3-byte codes, and LIVE555's framer only syncs on 4-byte ones.
  *
- * The ring is small (1.7 MB) and the writer laps it in ~4 s, so there is
- * no positional re-gate: while blocked on a full fifo the writer may
- * overwrite our position, and that is detected by watching the frame
- * counter across each blocking write (a block of ~1.2 s of ticks means
- * the bytes ahead were overwritten) and re-syncing to a fresh chain.
+ * The walk is COMPLETENESS-GATED: a NAL is emitted only when its end
+ * lies at least NAL_FLOOR before the writer's newest position signal
+ * (the newest c0 checkpoint entry, or the header queue slots when the
+ * app stops writing checkpoints mid-uptime - both modes verified live),
+ * so every emitted byte is provably final. The age at emit is the
+ * NAL's own write time (one frame) plus the head signal's lag -
+ * bitrate-independent, unlike a fixed byte gap. A long fifo block is
+ * just backpressure (the join/drop sprint draining at the client's
+ * rate), so there is deliberately NO time-based lap re-sync: the old
+ * tick check fired on exactly those blocks and looped forever
+ * (sprint -> block -> re-sync -> sprint). If the writer laps the walk,
+ * the gate stalls it until the chain gate re-arms at the next IDR. A
+ * join (or the MAX_LAG escape) emits the newest chain, then JUMPS the
+ * walk to the gate line - the mid-GOP backlog is dropped, because the
+ * drain runs at the writer's own rate and the backlog could never be
+ * closed by emitting it.
  *
  * Based on the design of h264grabber.c (GPL-3) by roleoroleo / yi-hack-v5.
  *
@@ -67,6 +78,7 @@
 #include <signal.h>
 #include <pthread.h>
 #include <errno.h>
+#include <time.h>
 
 #define BUFFER_FILE "/dev/shm/fshare_frame_buf"
 #define FRAME_COUNTER_OFFSET 0x18
@@ -78,7 +90,22 @@
  * so normal paced writes never trip it. A larger fifo + higher
  * threshold left a gray zone (1.6-3 s blocks) where the writer laps
  * us without a re-sync - full-frame conceal storms. */
-#define LAP_TICKS 50
+/* Completeness floor: a NAL is emitted only when its END lies at least
+ * this far before the writer's newest position signal (see drain_round),
+ * on top of the NAL's own length. A fixed byte gap is bitrate-blind:
+ * 192 KB is ~0.4 s of content at the motion bitrate but ~27 s on an
+ * ultra-static scene - the observed 13 s latency. Gating by the NAL's
+ * own length makes the age one frame at ANY bitrate. */
+#define NAL_FLOOR 128
+/* If the walk ever falls this far behind the head (a client stall
+ * longer than the gate can absorb), the backlog cannot be closed by
+ * sprinting - the fifo drain runs at the writer's own rate - so
+ * re-join at the newest chain and JUMP to the gate line instead of
+ * dragging minutes of doomed content. */
+#define MAX_LAG (768u * 1024)
+/* Backward moves of the head signal below this are round-robin jitter
+ * (a few KB), not a ring wrap (~1.7 MB); clamp them in update_head. */
+#define JITTER_MAX (64u * 1024)
 #define DEFAULT_FIFO "/tmp/h264_high_fifo"
 #define SCAN_START 0x100          /* skip the small header */
 #define POLL_MS 10
@@ -97,6 +124,10 @@ static int emit_mode;                 /* 1 when the current NAL belongs to it */
 /* Chain state across the NAL walk: 0 = outside a chain, 1 = accepted SPS
  * seen, 2 = accepted SPS+PPS seen. An IDR completes (and resets) it. */
 static int have_sps;
+/* 0 = normal walk, 1 = freshly (re-)joined and emitting the join chain,
+ * 2 = the chain's IDR is out: drain_forever jumps the walk to the gate
+ * line, dropping the un-closable mid-GOP backlog. */
+static int just_joined;
 /* Slice discriminator: the ring carries two interleaved streams whose
  * slices share the same 9a 00 header shape. The app's own frame table
  * (the 00 00 01 c0 entries, one per consumed frame) carries a TYPE
@@ -190,6 +221,19 @@ static int f2f_trace(void)
 {
     return getenv("F2F_TRACE") != NULL;
 }
+
+/* One-per-second diagnostics (F2F_AGELOG=1): where the walk sits relative
+ * to the app's write head, the emission rate, and how long fifo writes
+ * block us - the three numbers that explain a latency drift. Kept out of
+ * the emit path when disabled so production runs pay nothing. */
+static int f2f_agelog(void)
+{
+    return getenv("F2F_AGELOG") != NULL;
+}
+
+static volatile unsigned g_nals, g_bytes;    /* emitted since the last line */
+static volatile unsigned g_block_ticks;      /* ticks spent inside fifo writes */
+static volatile unsigned g_max_block;        /* longest single write (ticks) */
 
 static unsigned sps_read_ue(const uint8_t *s, size_t slen, size_t *pos)
 {
@@ -397,8 +441,9 @@ static uint32_t frame_counter(void)
  * (its counter field ticks with the frame counter). The entries carry the
  * frame counter at +8 and a 0x6a8a.. magic at +12, so an accidental code
  * match in slice data cannot fake one. Falls back to the max of the
- * header queue slots when no entry is present (record-mode rings). */
-static uint32_t head_estimate(void)
+ * header queue slots when no entry is present (record-mode rings).
+ * Sets *ctr_out (when given) to the entry's counter. */
+static uint32_t head_estimate(uint32_t *ctr_out)
 {
     uint32_t fctr = frame_counter();
     uint32_t best_pos = 0, best_ctr = 0;
@@ -418,8 +463,11 @@ static uint32_t head_estimate(void)
             best_pos = (uint32_t)p;
         }
     }
-    if (best_ctr)
+    if (best_ctr) {
+        if (ctr_out)
+            *ctr_out = best_ctr;
         return best_pos;
+    }
 
     /* fallback: round-robin queue of the last write positions at
      * 0x04/0x0C/0x10; the head is the newest (max) of the three */
@@ -431,8 +479,184 @@ static uint32_t head_estimate(void)
             if (v < buf_size && v > h)
                 h = v;
         }
+        if (ctr_out)
+            *ctr_out = 0;
         return h;
     }
+}
+
+/* Tracked writer head: the newest complete 00 00 01 c0 entry, kept by a
+ * bounded FORWARD scan from the last known one (entries only move
+ * forward with the frame counter, so a full-ring rescan per NAL is never
+ * needed). The walk itself is position-gated and can never discover
+ * entries past its own stop line; this peek does. Falls back to a
+ * full-ring scan when the forward scan makes no progress for ~2 s
+ * (entry-less record-mode rings, or a stale track after a mode change). */
+#define HEAD_SCAN_LIM (96u * 1024)
+static uint32_t head_pos;              /* newest entry's position (0 = unknown) */
+static uint32_t head_ctr;              /* its frame counter */
+static unsigned head_misses;           /* forward scans without progress */
+static uint32_t head_last;             /* last returned head (jitter clamp) */
+static uint32_t head_live_fctr;        /* frame counter at the last advance */
+
+/* The ring-diff sampler's writer position (diff_thread below):
+ * authoritative in every mode once the sampler has produced it. */
+#define DATA_BASE 0x224b0             /* writes never land below this */
+static uint8_t *shadow;               /* last sampled copy of the ring */
+static volatile uint32_t diff_head;   /* newest write position seen */
+
+static uint32_t update_head(void)
+{
+    uint32_t fctr = frame_counter();
+    size_t p = head_pos;
+    size_t scanned = 0;
+
+    if (head_pos != 0) {
+        while (scanned < HEAD_SCAN_LIM) {
+            if (p + 34 > buf_size)
+                p = 0;
+            if (p + 34 <= buf_size &&
+                buf[p] == 0x00 && buf[p + 1] == 0x00 && buf[p + 2] == 0x01 &&
+                buf[p + 3] == 0xc0) {
+                uint32_t ctr, magic;
+                memcpy(&ctr, (const void *)(buf + p + 8), sizeof(ctr));
+                memcpy(&magic, (const void *)(buf + p + 12), sizeof(magic));
+                if ((magic & 0xffff0000u) == 0x6a8a0000u &&
+                    ctr > head_ctr && ctr <= fctr) {
+                    head_ctr = ctr;
+                    head_pos = (uint32_t)p;
+                    head_misses = 0;
+                }
+            }
+            p++;
+            scanned++;
+        }
+    }
+    if (head_pos == 0 || ++head_misses > 60) {
+        uint32_t ctr = 0;
+        head_pos = head_estimate(&ctr);
+        if (ctr)
+            head_ctr = ctr;
+        head_misses = 0;
+    }
+
+    /* The diff sampler's head is authoritative in every mode; the c0
+     * and slot signals above are the seed (and the fallback if the
+     * sampler cannot allocate its shadow). */
+    if (diff_head != 0)
+        return diff_head;
+
+    /* Stale c0 stream: the app switches ring modes mid-uptime and stops
+     * writing checkpoints (verified live: the entries vanish while the
+     * frame counter keeps ticking). Fall back to the header queue slots
+     * at 0x04/0x08/0x0C/0x10 - the writer's own round-robin position
+     * queue; the max of the four is the newest write. The slot head is
+     * returned WITHOUT touching head_pos/head_ctr, so the c0 tracking
+     * resumes automatically if the app returns to the steady-state
+     * mode. 300 ticks (~6.7 s) is far beyond any steady-state entry gap
+     * (checkpoints come ~5 frames apart). */
+    {
+        uint32_t h = head_pos;
+        if (head_pos != 0 && frame_counter() - head_ctr > 300) {
+            uint32_t v, m = 0;
+            unsigned off;
+            for (off = 0x04; off <= 0x10; off += 4) {
+                memcpy(&v, (const void *)(buf + off), sizeof(v));
+                if (v < buf_size && v > m)
+                    m = v;
+            }
+            h = m;   /* 0 when even the slots are dead: heartbeat gate */
+        }
+        /* The slot signal jitters a few KB BACKWARD between updates
+         * (the queue's max is not strictly monotonic). A raw backward
+         * step would flip the walk's gate open - the wrapped distance
+         * becomes ~1.7 MB - and the walk sprints a whole ring lap.
+         * Clamp small backward moves; a real lap wraps by ~1.7 MB. */
+        if (h != 0 && head_last != 0 && h < head_last &&
+            head_last - h < JITTER_MAX)
+            h = head_last;
+        if (h != 0 && h != head_last) {
+            head_last = h;
+            head_live_fctr = frame_counter();
+        }
+        /* Dead signal: the counter ticks but the position signal has
+         * not moved for ~13 s (verified live: the slots freeze when
+         * the writer reaches the buffer end). A frozen nonzero head
+         * deadlocks the walk at the gate; the heartbeat gate at least
+         * keeps the stream moving until the signal recovers. */
+        if (head_last != 0 &&
+            frame_counter() - head_live_fctr > 600)
+            return 0;
+        return h;
+    }
+}
+
+/* ---- writer position sampler (ring diff) ---- */
+/* The app's position signals (c0 checkpoints, header slots) die when
+ * the ring switches modes mid-uptime (verified live: the slots froze at
+ * the buffer end while the encoder kept running). The writer's true
+ * position is observable anyway: it writes contiguously, so the TOP of
+ * the newest changed bytes in a periodic diff of the ring IS the write
+ * head, in every mode. The sampler keeps a shadow copy and diffs the
+ * window ahead of the last known head every 250 ms; the completeness
+ * gate then runs against a position never more than ~110 KB stale
+ * (0.25 s at the peak bitrate). */
+#define DIFF_WIN (512u * 1024)       /* > max bytes per sample at peak rate */
+
+static void *diff_thread(void *arg)
+{
+    int first = 1;
+    uint32_t base = DATA_BASE;
+    (void)arg;
+
+    usleep(250 * 1000);
+    while (1) {
+        uint32_t q = base;
+        size_t left = first ? buf_size : DIFF_WIN;
+        uint32_t run0 = 0, run1 = 0;
+        int run = 0;
+        size_t i;
+
+        while (left > 0) {
+            size_t n;
+            if (q >= buf_size)
+                q = 0;
+            if (q < DATA_BASE)
+                q = DATA_BASE;
+            n = buf_size - q;
+            if (n > left)
+                n = left;
+            for (i = 0; i < n; i++) {
+                if (buf[q + i] != shadow[q + i]) {
+                    if (!run) {
+                        run = 1;
+                        run0 = q + i;
+                    }
+                    run1 = q + i;
+                }
+            }
+            q += (uint32_t)n;
+            left -= n;
+        }
+        if (run) {
+            /* The writer moved [base, run1]: refresh the shadow and
+             * advance the head to the newest byte seen. */
+            if (run1 >= base) {
+                memcpy(shadow + base, (const void *)(buf + base),
+                       run1 + 1 - base);
+            } else {
+                memcpy(shadow + base, (const void *)(buf + base),
+                       buf_size - base);
+                memcpy(shadow, (const void *)buf, run1 + 1);
+            }
+            base = (run1 + 1 >= buf_size) ? DATA_BASE : run1 + 1;
+            diff_head = base;
+            (void)run0;
+        }
+        first = 0;
+        usleep(250 * 1000);
+    }
+    return NULL;
 }
 
 /* Distance from pos to the (cached) head position. */
@@ -474,9 +698,15 @@ static int write_all_fd(int fd, const void *p, size_t n)
 static uint8_t nal_copy[NAL_COPY_MAX];
 
 /* Emit one NAL (ring positions s..e) as 4-byte start code + body,
- * handling the ring wrap. Returns 0, -1 (would block), -2 (error), or
- * -3 (the fifo blocked us long enough that the writer overwrote our
- * read position: re-sync to a fresh chain). */
+ * handling the ring wrap. Returns 0, -1 (would block), or -2 (error).
+ * A long block here is just fifo backpressure: the walk sprinted a
+ * backlog (e.g. the join chain) and the client drains at its own pace.
+ * There is deliberately NO time-based lap re-sync: with the positional
+ * gate the writer can never overwrite unread bytes, and if it does lap
+ * the walk, the gate stalls the walk until the chain gate re-arms at
+ * the next IDR (a bounded, self-healing mid-GOP conceals window). The
+ * old tick check fired spuriously on exactly these sprint blocks and
+ * looped forever: sprint -> block >= 1.1 s -> re-sync -> sprint. */
 static int emit_nal(size_t s, size_t e)
 {
     static const unsigned char start4[4] = {0x00, 0x00, 0x00, 0x01};
@@ -497,8 +727,16 @@ static int emit_nal(size_t s, size_t e)
         r = write_all_fd(out_fd, nal_copy, len);
         if (r != 0)
             return r;
-        if (frame_counter() - c0 >= LAP_TICKS)
-            return -3;                /* the NAL is complete; re-sync now */
+        if (f2f_agelog()) {
+            uint32_t c1 = frame_counter();
+            g_nals++;
+            g_bytes += len + 4;
+            if (c1 > c0) {
+                g_block_ticks += c1 - c0;
+                if (c1 - c0 > g_max_block)
+                    g_max_block = c1 - c0;
+            }
+        }
         return 0;
     }
 
@@ -537,7 +775,7 @@ static int find_idr_start(size_t *out)
     size_t chain_start = 0;
     int found_chain = 0;
     int pass;
-    uint32_t head = head_estimate();  /* once per call: the scan is costly */
+    uint32_t head = head_estimate(NULL);  /* once per call: the scan is costly */
 
     for (pass = 0; pass < 2; pass++) {
         size_t scanned = 0;
@@ -621,35 +859,54 @@ static int find_idr_start(size_t *out)
     return 1;
 }
 
-/* Forward NAL units of the target stream while the producer keeps bumping
- * the frame counter. Called repeatedly; pos carries the read position
- * across calls. NAL start codes are written as 4-byte. With "force", the
- * counter catch-up check is skipped (one-shot dumps of static snapshots).
- * Returns 0, 1 (the writer lapped us while we were blocked: caller must
- * re-sync to a fresh chain), or 2 (hard error). */
-static int drain_round(size_t *pos, uint32_t *last, int force)
+/* Forward NAL units of the target stream, COMPLETENESS-GATED: a NAL
+ * whose end lies at least NAL_FLOOR before the writer's newest position
+ * signal (head) is provably complete - the writer signals its position
+ * only after writing past it - and is emitted; anything closer may be
+ * in flight and stops the walk. The gate's distance is the NAL's OWN
+ * length, so the emitted content is ~one frame old at ANY bitrate (a
+ * fixed byte gap was 0.4 s at the motion bitrate but ~27 s on an
+ * ultra-static scene). Without a position signal the walk falls back to
+ * the old heartbeat stop. With "force", the gate is skipped (one-shot
+ * dumps of static snapshots).
+ * Returns 0 or 2 (hard error). */
+static int drain_round(size_t *pos, uint32_t head, int force)
 {
+    static uint32_t hb;               /* heartbeat for the no-head fallback */
     int i;
 
     for (i = 0; i < 256; i++) {
         size_t s = *pos, e;
+        size_t len;
+        uint8_t t;
 
         if (!next_sc(&s, 0))          /* nothing in the ring */
             return 0;
         e = s + 4;
         if (!next_sc(&e, 0) || e == s) /* no complete NAL yet */
             return 0;
+        len = (e > s) ? (e - s - 3) : (buf_size - s - 3 + e);
+        if (!force) {
+            if (head != 0) {
+                if (dist_to_head_cached(s, head) < len + 3 + NAL_FLOOR)
+                    return 0;         /* may be in flight: wait */
+            } else if (frame_counter() == hb) {
+                /* no writer position signal (record-mode ring): fall
+                 * back to the heartbeat stop */
+                return 0;
+            } else {
+                hb = frame_counter();
+            }
+        }
+        t = buf[s + 3] & 0x1F;
         if (want_nal(s, e)) {
             int r = emit_nal(s, e);
             if (r != 0)
-                return r == -3 ? 1 : r;
+                return r;
+            if (t == 5 && just_joined == 1)
+                just_joined = 2;      /* join chain out: caller jumps */
         }
         *pos = e;
-        if (force)
-            continue;
-        if (frame_counter() == *last) /* caught up with the writer */
-            return 0;
-        *last = frame_counter();
     }
     return 0;
 }
@@ -657,38 +914,84 @@ static int drain_round(size_t *pos, uint32_t *last, int force)
 static void drain_forever(void)
 {
     size_t pos = stream_base;
-    uint32_t last = frame_counter();
+    time_t next_log = 0;
+    int head_was_dead = 0;
+    just_joined = 1;
 
     while (1) {
-        uint32_t c = frame_counter();
+        uint32_t head = update_head();
         int r;
 
-        if (c == last) {
-            usleep(POLL_MS * 1000);
+        if (f2f_agelog()) {
+            time_t t = time(NULL);
+            if (t >= next_log) {
+                fprintf(stderr,
+                        "age: pos=0x%zx head=0x%x dist=%zu nals=%u "
+                        "bytes=%u block_ticks=%u max_block=%u fctr=%u\n",
+                        pos, head, dist_to_head_cached(pos, head),
+                        g_nals, g_bytes, g_block_ticks, g_max_block,
+                        frame_counter());
+                g_nals = g_bytes = g_block_ticks = g_max_block = 0;
+                next_log = t + 1;
+            }
+        }
+
+        r = drain_round(&pos, head, 0);
+        if (r == 2) {
+            perror("write");
+            return;
+        }
+        if (head == 0) {
+            /* Dead position signal: the heartbeat gate ran the walk
+             * blindly (see update_head); the positional machinery
+             * below is meaningless until the signal recovers. */
+            head_was_dead = 1;
+            just_joined = 0;
+            usleep(30 * 1000);
             continue;
         }
-        last = c;
-        r = drain_round(&pos, &last, 0);
-        if (r == 1) {
-            /* We stalled on the fifo long enough for the writer to lap
-             * our read position (the ring only holds a few seconds of
-             * video) - jump to the newest chain. */
+        if (head_was_dead) {
+            /* The signal recovered while the walk roamed blind: its
+             * position is meaningless - re-join at the newest chain. */
+            head_was_dead = 0;
             if (find_idr_start(&pos)) {
-                /* Let the chain age ~1 s before walking: with the fifo
-                 * drained (which is what unblocked us), an unpaced walk
-                 * races to the writer's active region and emits
-                 * half-written slices - a deterministic burst of ~5
-                 * full-frame conceals. A 1 s head start keeps the paced
-                 * walk clear of the writer forever. */
                 usleep(1000 * 1000);
-                last = frame_counter();
-                fprintf(stderr, "re-sync: IDR start at 0x%zX\n", pos);
+                just_joined = 1;
+                fprintf(stderr, "re-join: IDR start at 0x%zX\n", pos);
             } else {
                 usleep(200 * 1000);
             }
-        } else if (r == 2) {
-            perror("write");
-            return;
+            continue;
+        }
+        if (just_joined == 2) {
+            /* The join chain is out: jump the walk to just behind the
+             * head, dropping the mid-GOP backlog. The fifo drain runs
+             * at the writer's own rate, so the backlog could never be
+             * closed by emitting it - every sprint leaves the lag
+             * exactly where it started. The decoder conceals the
+             * dropped frames and goes live at ~one frame of age. */
+            size_t j = head >= NAL_FLOOR ? head - NAL_FLOOR
+                                         : buf_size + head - NAL_FLOOR;
+            if (j > buf_size - 4)
+                j = buf_size - 4;
+            pos = j;
+            just_joined = 0;
+            fprintf(stderr, "jump: pos=0x%zx head=0x%x\n", pos, head);
+        } else if (just_joined == 0 &&
+                   dist_to_head_cached(pos, head) > MAX_LAG) {
+            /* Escaped the gate (a client stall longer than the gap):
+             * re-join at the newest chain and drop the backlog. */
+            if (find_idr_start(&pos)) {
+                usleep(1000 * 1000);
+                just_joined = 1;
+                fprintf(stderr, "re-join: IDR start at 0x%zX\n", pos);
+            } else {
+                usleep(200 * 1000);
+            }
+        } else {
+            /* Gated stop (or nothing to emit): wait for the writer to
+             * advance past the gate line, then walk again. */
+            usleep(30 * 1000);
         }
     }
 }
@@ -733,6 +1036,15 @@ int main(int argc, char **argv)
         return 1;
     }
 
+    /* Writer-position sampler: its shadow starts as a copy of the ring
+     * now, so the first diff sees everything written since startup. */
+    shadow = malloc(buf_size);
+    if (shadow) {
+        pthread_t diff_tid;
+        memcpy(shadow, (const void *)buf, buf_size);
+        pthread_create(&diff_tid, NULL, diff_thread, NULL);
+    }
+
     /* The fifo is opened before the start-point wait below, so a server
      * can attach immediately and just see no bytes until the gate passes. */
     if (out_file) {
@@ -762,10 +1074,8 @@ int main(int argc, char **argv)
         }
         /* 256 KB fifo (kernel default is 64 KB): big enough for a
          * complete SPS+PPS+IDR chain (the join window the server's
-         * startup drain keeps), small enough that the server's paced
-         * drain bursts stay well under LAP_TICKS - the lap detector
-         * then fires only on real client stalls, before the writer can
-         * overwrite our position. On this kernel the call only works
+         * startup drain keeps), small enough to keep the end-to-end
+         * latency near one GOP. On this kernel the call only works
          * from the first reader's side; the server sets it there too,
          * so failure here is not fatal. */
         {
@@ -804,9 +1114,8 @@ int main(int argc, char **argv)
     usleep(1000 * 1000);
 
     if (one_shot) {
-        /* dump one sweep of the target stream, ignoring the counter */
-        uint32_t last = frame_counter() - 1;
-        drain_round(&stream_base, &last, 1);
+        /* dump one sweep of the target stream, ignoring the gate */
+        drain_round(&stream_base, head_estimate(NULL), 1);
     } else {
         drain_forever();
     }
