@@ -674,6 +674,13 @@ static void drain_forever(void)
              * our read position (the ring only holds a few seconds of
              * video) - jump to the newest chain. */
             if (find_idr_start(&pos)) {
+                /* Let the chain age ~1 s before walking: with the fifo
+                 * drained (which is what unblocked us), an unpaced walk
+                 * races to the writer's active region and emits
+                 * half-written slices - a deterministic burst of ~5
+                 * full-frame conceals. A 1 s head start keeps the paced
+                 * walk clear of the writer forever. */
+                usleep(1000 * 1000);
                 last = frame_counter();
                 fprintf(stderr, "re-sync: IDR start at 0x%zX\n", pos);
             } else {
@@ -788,6 +795,10 @@ int main(int argc, char **argv)
     }
     fprintf(stderr, "IDR start at 0x%zX, target %ux%u, buffer %zu bytes\n",
             stream_base, target_w, target_h, buf_size);
+
+    /* Same as the re-sync delay: with an empty fifo the initial walk
+     * outruns the writer and reads its half-written slices. */
+    usleep(1000 * 1000);
 
     if (one_shot) {
         /* dump one sweep of the target stream, ignoring the counter */
