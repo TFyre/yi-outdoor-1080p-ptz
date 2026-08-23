@@ -75,6 +75,7 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <sys/mman.h>
+#include <sys/ioctl.h>
 #include <signal.h>
 #include <pthread.h>
 #include <errno.h>
@@ -146,20 +147,43 @@ static int just_joined;
  * another. */
 #define MIN_MAIN 700
 
-/* Keep the fifo open for writing without blocking forever when no reader
- * has appeared yet: a helper thread opens it read-only to unblock us, then
- * parks with the fd open (a fifo writer with no reader gets EPIPE).
+/* Fifo purger thread: holds the read end open (a fifo writer with no
+ * reader gets EPIPE; the open also completes the reader/writer open
+ * dance with the producer's write open below) and, when the fifo is
+ * IDLE-FULL, discards the OLD bytes keeping a fresh ~224 KB tail - big
+ * enough for a complete SPS+PPS+IDR chain. Without this, a fifo left
+ * full from the last session serves the next client minutes-old
+ * content (the observed "starts fresh, then jumps back" connect
+ * wobble). A slow live client is trimmed the same way: it conceals the
+ * gap and comes back live instead of dragging the backlog.
  *
- * NOTE: it must never read() from the fifo - an early version did and
- * silently stole the first 1024 bytes of the stream (the SPS+PPS+IDR
- * head), which made every client join mid-GOP. */
-static void *unlock_fifo_thread(void *arg)
+ * It must never consume the stream head while the fifo is NOT full -
+ * an early version ate the first 1024 bytes (the SPS+PPS+IDR head)
+ * and made every client join mid-GOP. */
+static void *fifo_purger_thread(void *arg)
 {
     const char *fifo_name = arg;
-    int fd = open(fifo_name, O_RDONLY);
-    if (fd >= 0) {
-        while (1)
-            pause();               /* hold the fd open; never consume data */
+    int fd = open(fifo_name, O_RDONLY);   /* blocking: completes the dance */
+    uint8_t drain[65536];
+
+    if (fd < 0)
+        return NULL;
+    fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBLOCK);
+    while (1) {
+        int n = 0;
+        if (ioctl(fd, FIONREAD, &n) == 0 && n > 224 * 1024) {
+            while (n > 224 * 1024) {
+                size_t want = (size_t)n - 224 * 1024;
+                ssize_t r;
+                if (want > sizeof(drain))
+                    want = sizeof(drain);
+                r = read(fd, drain, want);
+                if (r <= 0)
+                    break;
+                n -= (int)r;
+            }
+        }
+        usleep(250 * 1000);
     }
     return NULL;
 }
@@ -234,6 +258,7 @@ static int f2f_agelog(void)
 static volatile unsigned g_nals, g_bytes;    /* emitted since the last line */
 static volatile unsigned g_block_ticks;      /* ticks spent inside fifo writes */
 static volatile unsigned g_max_block;        /* longest single write (ticks) */
+static volatile unsigned g_drops;            /* NALs dropped on a full fifo */
 
 static unsigned sps_read_ue(const uint8_t *s, size_t slen, size_t *pos)
 {
@@ -501,7 +526,7 @@ static uint32_t head_live_fctr;        /* frame counter at the last advance */
 
 /* The ring-diff sampler's writer position (diff_thread below):
  * authoritative in every mode once the sampler has produced it. */
-#define DATA_BASE 0x224b0             /* writes never land below this */
+#define DATA_BASE 0x100               /* below this is header/slots only */
 static uint8_t *shadow;               /* last sampled copy of the ring */
 static volatile uint32_t diff_head;   /* newest write position seen */
 
@@ -600,7 +625,9 @@ static uint32_t update_head(void)
  * head, in every mode. The sampler keeps a shadow copy and diffs the
  * window ahead of the last known head every 250 ms; the completeness
  * gate then runs against a position never more than ~110 KB stale
- * (0.25 s at the peak bitrate). */
+ * (0.25 s at the peak bitrate). Only the header (below 0x100) is
+ * excluded: the ring's data base itself varies by mode/era (measured
+ * below 0x224b0), so everything above the header must be scanned. */
 #define DIFF_WIN (512u * 1024)       /* > max bytes per sample at peak rate */
 
 static void *diff_thread(void *arg)
@@ -613,7 +640,8 @@ static void *diff_thread(void *arg)
     while (1) {
         uint32_t q = base;
         size_t left = first ? buf_size : DIFF_WIN;
-        uint32_t run0 = 0, run1 = 0;
+        uint32_t run1 = 0;
+        unsigned changed = 0;
         int run = 0;
         size_t i;
 
@@ -628,30 +656,31 @@ static void *diff_thread(void *arg)
                 n = left;
             for (i = 0; i < n; i++) {
                 if (buf[q + i] != shadow[q + i]) {
-                    if (!run) {
-                        run = 1;
-                        run0 = q + i;
-                    }
+                    /* run1 = the LAST changed byte in scan order: the
+                     * writer writes contiguously in time, so this is
+                     * its newest position even when coincidentally
+                     * unchanged bytes split the span into fragments. */
+                    run = 1;
                     run1 = q + i;
+                    changed++;
                 }
             }
+            /* Refresh the shadow for the WHOLE scanned chunk now: the
+             * window wraps past the buffer end, and without this the
+             * wrapped portion compares against a startup-era shadow -
+             * false changes there yanked the head backward by hundreds
+             * of KB and made the walk chase garbage. */
+            memcpy(shadow + q, (const void *)(buf + q), n);
             q += (uint32_t)n;
             left -= n;
         }
         if (run) {
-            /* The writer moved [base, run1]: refresh the shadow and
-             * advance the head to the newest byte seen. */
-            if (run1 >= base) {
-                memcpy(shadow + base, (const void *)(buf + base),
-                       run1 + 1 - base);
-            } else {
-                memcpy(shadow + base, (const void *)(buf + base),
-                       buf_size - base);
-                memcpy(shadow, (const void *)buf, run1 + 1);
-            }
+            if (f2f_trace())
+                fprintf(stderr,
+                        "diff: base=0x%x run1=0x%x changed=%u\n",
+                        (unsigned)base, (unsigned)run1, changed);
             base = (run1 + 1 >= buf_size) ? DATA_BASE : run1 + 1;
             diff_head = base;
-            (void)run0;
         }
         first = 0;
         usleep(250 * 1000);
@@ -668,19 +697,33 @@ static size_t dist_to_head_cached(size_t pos, uint32_t head)
     return (size_t)h + buf_size - pos;
 }
 
-/* Write all n bytes to fd, looping over partial writes.
- * Returns 0 on success, -1 if the fd would block (fifo full), -2 on a
- * hard error. */
-static int write_all_fd(int fd, const void *p, size_t n)
+/* Write all n bytes to fd, looping over partial writes. A full fifo
+ * retries for up to ~10 ms before giving up: equal-rate pacing (the
+ * client plays at wall-clock speed, the walk writes at the writer's
+ * speed) fills the fifo TRANSIENTLY all the time, and those absorb as
+ * micro-stalls instead of dropping a NAL (a dropped NAL is a concealed
+ * frame). Only a REAL stall returns -1, which drops the NAL and keeps
+ * the walk glued to the writer. The budget must stay small: with no
+ * client every NAL burns it, and a long budget makes the walk's
+ * rounds crawl far behind the writer.
+ * Returns 0 on success, -1 (fifo full past the retry budget), or -2
+ * on a hard error. */
+static int write_all_fd_pace(int fd, const void *p, size_t n)
 {
     const uint8_t *b = p;
+    int tries = 0;
     while (n > 0) {
         ssize_t w = write(fd, b, n);
         if (w < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK)
-                return -1;
-            return -2;
+            if ((errno == EAGAIN || errno == EWOULDBLOCK) &&
+                tries < 5) {
+                tries++;
+                usleep(2000);
+                continue;
+            }
+            return (errno == EAGAIN || errno == EWOULDBLOCK) ? -1 : -2;
         }
+        tries = 0;
         b += w;
         n -= (size_t)w;
     }
@@ -721,10 +764,10 @@ static int emit_nal(size_t s, size_t e)
         len = copy_nal(s, e, nal_copy, sizeof(nal_copy));
         if (len == 0)
             return -2;
-        r = write_all_fd(out_fd, start4, sizeof(start4));
+        r = write_all_fd_pace(out_fd, start4, sizeof(start4));
         if (r != 0)
             return r;
-        r = write_all_fd(out_fd, nal_copy, len);
+        r = write_all_fd_pace(out_fd, nal_copy, len);
         if (r != 0)
             return r;
         if (f2f_agelog()) {
@@ -901,10 +944,22 @@ static int drain_round(size_t *pos, uint32_t head, int force)
         t = buf[s + 3] & 0x1F;
         if (want_nal(s, e)) {
             int r = emit_nal(s, e);
-            if (r != 0)
+            if (r == -1) {
+                /* Fifo full: DROP the NAL and keep walking. Blocking
+                 * here instead would freeze the walk while the writer
+                 * advances - the next client then unblocks us into a
+                 * backlog sprint of old content, followed by a re-join
+                 * at an older chain (the observed connect-time "starts
+                 * fresh, then jumps back"). Dropping keeps the walk
+                 * glued to the writer no matter how long the client
+                 * stalls; the purger thread keeps the fifo tail fresh
+                 * for the next join. */
+                g_drops++;
+            } else if (r != 0) {
                 return r;
-            if (t == 5 && just_joined == 1)
+            } else if (t == 5 && just_joined == 1) {
                 just_joined = 2;      /* join chain out: caller jumps */
+            }
         }
         *pos = e;
     }
@@ -927,11 +982,13 @@ static void drain_forever(void)
             if (t >= next_log) {
                 fprintf(stderr,
                         "age: pos=0x%zx head=0x%x dist=%zu nals=%u "
-                        "bytes=%u block_ticks=%u max_block=%u fctr=%u\n",
+                        "bytes=%u block_ticks=%u max_block=%u drops=%u "
+                        "fctr=%u\n",
                         pos, head, dist_to_head_cached(pos, head),
                         g_nals, g_bytes, g_block_ticks, g_max_block,
-                        frame_counter());
-                g_nals = g_bytes = g_block_ticks = g_max_block = 0;
+                        g_drops, frame_counter());
+                g_nals = g_bytes = g_block_ticks = g_max_block =
+                    g_drops = 0;
                 next_log = t + 1;
             }
         }
@@ -963,6 +1020,21 @@ static void drain_forever(void)
             }
             continue;
         }
+        if (just_joined == 0 &&
+            dist_to_head_cached(pos, head) > MAX_LAG) {
+            /* Escaped the gate (a client stall longer than the gap):
+             * re-join at the newest chain BEFORE emitting anything -
+             * a backlog sprint here serves old content to a fresh
+             * client. */
+            if (find_idr_start(&pos)) {
+                usleep(1000 * 1000);
+                just_joined = 1;
+                fprintf(stderr, "re-join: IDR start at 0x%zX\n", pos);
+            } else {
+                usleep(200 * 1000);
+            }
+            continue;
+        }
         if (just_joined == 2) {
             /* The join chain is out: jump the walk to just behind the
              * head, dropping the mid-GOP backlog. The fifo drain runs
@@ -977,17 +1049,6 @@ static void drain_forever(void)
             pos = j;
             just_joined = 0;
             fprintf(stderr, "jump: pos=0x%zx head=0x%x\n", pos, head);
-        } else if (just_joined == 0 &&
-                   dist_to_head_cached(pos, head) > MAX_LAG) {
-            /* Escaped the gate (a client stall longer than the gap):
-             * re-join at the newest chain and drop the backlog. */
-            if (find_idr_start(&pos)) {
-                usleep(1000 * 1000);
-                just_joined = 1;
-                fprintf(stderr, "re-join: IDR start at 0x%zX\n", pos);
-            } else {
-                usleep(200 * 1000);
-            }
         } else {
             /* Gated stop (or nothing to emit): wait for the writer to
              * advance past the gate line, then walk again. */
@@ -1058,20 +1119,20 @@ int main(int argc, char **argv)
             perror("mkfifo");
             return 1;
         }
-        /* unblock our writer-open in case no reader has connected yet */
-        pthread_create(&unlock_thread, NULL, unlock_fifo_thread,
+        /* The purger's read-open completes the fifo open dance and
+         * keeps the write end from EPIPE; see fifo_purger_thread. */
+        pthread_create(&unlock_thread, NULL, fifo_purger_thread,
                        (void *)fifo_name);
-        /* Blocking writer: the fifo paces us to the reader (a client
-         * playing at real-time speed). While we block, the ring writer
-         * laps our read position; the frame-counter watch in
-         * write_all_fd_lap detects that once we unblock and re-syncs to
-         * a fresh chain. The unlock thread's read-open keeps this open
-         * from blocking forever when no real reader exists. */
+        /* NON-BLOCKING writer: a full fifo must make emit_nal DROP the
+         * NAL (and stay glued to the writer), never block - blocking
+         * here is what let the walk fall behind during idle periods
+         * and served the next client a backlog sprint. */
         out_fd = open(fifo_name, O_WRONLY);
         if (out_fd < 0) {
             perror(fifo_name);
             return 1;
         }
+        fcntl(out_fd, F_SETFL, fcntl(out_fd, F_GETFL, 0) | O_NONBLOCK);
         /* 256 KB fifo (kernel default is 64 KB): big enough for a
          * complete SPS+PPS+IDR chain (the join window the server's
          * startup drain keeps), small enough to keep the end-to-end
