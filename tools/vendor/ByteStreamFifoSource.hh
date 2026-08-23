@@ -63,6 +63,7 @@ protected:
     virtual ~ByteStreamFifoSource();
 
     static void fileReadableHandler(ByteStreamFifoSource* source, int mask);
+    static void retryRead(ByteStreamFifoSource* source);
     void doReadFromFile();
 
 private:

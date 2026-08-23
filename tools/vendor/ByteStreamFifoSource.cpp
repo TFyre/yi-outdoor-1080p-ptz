@@ -215,6 +215,16 @@ void ByteStreamFifoSource::fileReadableHandler(ByteStreamFifoSource* source, int
     source->doReadFromFile();
 }
 
+void ByteStreamFifoSource::retryRead(ByteStreamFifoSource* source) {
+    // Periodic fallback for the background handler: a missed readable
+    // transition on the fifo leaves the server idle with a full fifo and
+    // the producer blocked in pipe_wait (the stream stalls until another
+    // client's drain shakes it loose). Poll every 100 ms while awaiting.
+    source->nextTask() = NULL;
+    if (source->isCurrentlyAwaitingData())
+        source->doReadFromFile();
+}
+
 void ByteStreamFifoSource::doReadFromFile() {
     // Serve the kept drain tail first (see createNew): it ends exactly
     // where the fifo's current content begins, so the stream stays
@@ -251,8 +261,14 @@ void ByteStreamFifoSource::doReadFromFile() {
                 return;
             }
             if (n < 0) {
-                if (errno == EAGAIN || errno == EWOULDBLOCK)
-                    return;      /* background handler will re-trigger on data */
+                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    /* fifo momentarily empty: also arm the polling retry
+                     * (see retryRead) so a missed handler transition
+                     * cannot stall the stream */
+                    nextTask() = envir().taskScheduler().scheduleDelayedTask(
+                        100000, (TaskFunc*)&retryRead, this);
+                    return;
+                }
                 handleClosure();
                 return;
             }

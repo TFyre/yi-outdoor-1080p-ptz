@@ -18,11 +18,14 @@
  *   - the second stream's SPS is level 0x16, so IDRs are only emitted
  *     inside a chain that started with a target-resolution SPS (chain
  *     gating in want_nal)
- *   - the two streams' P-slices INTERLEAVE and share the 9a 00 shape;
- *     only the pic_order_cnt byte differs (0x90 vs 0x91 in raw mode).
- *     It is learned from the first slice after the join chain and then
- *     enforced (stream_q) - mixing both streams corrupts every P frame,
- *     filtering them apart decodes with zero errors
+ *   - the two streams' P-slices INTERLEAVE, share the 9a 00 shape AND
+ *     share frame numbers; the target frames are multi-slice (big main
+ *     >= 600 bytes + small twin repeating the main's frame number), the
+ *     other stream's slices are all small with frame number main+0x1c.
+ *     The pic_order_cnt byte is NOT a usable discriminator (it differed
+ *     between streams in one capture era, 0x90 vs 0x91, and became
+ *     identical 0x92 in another). Mixing the streams corrupts every P
+ *     frame; the size + twin-frame-number rules filter them apart.
  *   - the 00 00 01 c0 table entries carry the app's frame counter and are
  *     the newest-write beacon (head_estimate), replacing the unreliable
  *     header queue slots
@@ -67,10 +70,15 @@
 
 #define BUFFER_FILE "/dev/shm/fshare_frame_buf"
 #define FRAME_COUNTER_OFFSET 0x18
-/* The writer ticks the frame counter ~43/s. A fifo write that blocks for
- * this many ticks (>= ~1.2 s) means the app kept writing while we were
- * stuck and our read position has likely been overwritten. */
-#define LAP_TICKS 50
+/* The writer ticks the frame counter ~43/s and laps the 1.7 MB ring in
+ * ~4 s. A fifo write that blocks for this many ticks (>= ~3 s) means the
+ * app kept writing while we were stuck and our read position has been
+ * overwritten. The threshold must sit ABOVE the server's natural drain
+ * bursts (the 1 MB fifo drains in ~2.3 s at 1x pacing): anything lower
+ * fires on every normal block, and each spurious re-sync stalls the
+ * stream ~1 s (full-ring chain scan) plus jumps mid-GOP - the client
+ * sees full-frame conceals and an accumulating delay. */
+#define LAP_TICKS 130
 #define DEFAULT_FIFO "/tmp/h264_high_fifo"
 #define SCAN_START 0x100          /* skip the small header */
 #define POLL_MS 10
@@ -90,11 +98,22 @@ static int emit_mode;                 /* 1 when the current NAL belongs to it */
  * seen, 2 = accepted SPS+PPS seen. An IDR completes (and resets) it. */
 static int have_sps;
 /* Slice discriminator: the ring carries two interleaved streams whose
- * slices share the same 9a 00 header shape; only the pic_order_cnt byte
- * differs (0x90 for the target stream in raw mode, 0x91 for the other
- * one). Learned from the first slice after the join chain, then enforced.
- * 0 = not learned yet. */
-static uint8_t stream_q;
+ * slices share the same 9a 00 header shape. The app's own frame table
+ * (the 00 00 01 c0 entries, one per consumed frame) carries a TYPE
+ * field at entry offset 24: 0x0400 = high-res video, 0x0800 = low-res
+ * video, 0x0100 = audio - the same flags as roleoroleo's
+ * yi-hack-Allwinner-v2 frame_header. Every entry-framed high-res slice
+ * in the captures is >= 955 bytes (P and B frames alike, 1.2-25 KB)
+ * while the low-res stream's slices are <= 475 bytes, so size splits
+ * the streams: mains are emitted when >= 700 bytes, and a small slice
+ * is emitted only as a twin when its frame number repeats the
+ * immediately preceding main's (the low-res stream's fn runs main+0x1c
+ * and never matches). The pic_order_cnt byte is NOT usable: it differed
+ * between the streams in one capture era (0x90 vs 0x91) and became
+ * identical (0x92) in another.
+ * 0xff = no main seen yet (frame numbers observed are 0x02..0x3a). */
+#define MIN_MAIN 700
+static uint8_t last_main_fn = 0xff;
 
 /* Keep the fifo open for writing without blocking forever when no reader
  * has appeared yet: a helper thread opens it read-only to unblock us, then
@@ -319,14 +338,14 @@ static int want_nal(size_t p, size_t e)
             return 0;
         if (hd[1] != 0x9a || hd[2] != 0x00)
             return 0;                 /* not a real slice of this camera */
-        if (stream_q == 0) {
-            if (hd[6] < 0x80)
-                return 0;             /* implausible; keep waiting */
-            stream_q = hd[6];
-            if (f2f_trace())
-                fprintf(stderr, "stream slice byte = 0x%02x\n", stream_q);
-        } else if (hd[6] != stream_q) {
-            return 0;                 /* the other interleaved stream */
+        if (body < MIN_MAIN) {
+            /* small slices: only the twin (its frame number repeats the
+             * preceding main's); the other stream's slices carry main+0x1c
+             * and never match */
+            if (hd[3] != last_main_fn)
+                return 0;
+        } else {
+            last_main_fn = hd[3];
         }
         have_sps = 0;                 /* a slice breaks the chain */
         return 1;
@@ -531,6 +550,8 @@ static int find_idr_start(size_t *out)
     int pass;
     uint32_t head = head_estimate();  /* once per call: the scan is costly */
 
+    last_main_fn = 0xff;   /* the drain walk re-learns from the first main */
+
     for (pass = 0; pass < 2; pass++) {
         size_t scanned = 0;
         p = SCAN_START;
@@ -571,9 +592,7 @@ static int find_idr_start(size_t *out)
             want = 0;
             if (pass == 1) {
                 if (t == 1) {
-                    /* slices break the chain but are never emitted here:
-                     * the stream discriminator must be learned only from
-                     * the walk that follows the chosen chain */
+                    /* slices break the chain but are never emitted here */
                     have_sps = 0;
                 } else {
                     want = want_nal(p, e);
@@ -607,16 +626,11 @@ static int find_idr_start(size_t *out)
             p = e;
         }
     }
-    /* The target must be a real high-res stream: if the dims scan missed
-     * every high-res SPS (mid-lap overwrite), locking onto the low-res
-     * stream (640x368) would switch the client's resolution - retry
-     * instead. */
     if (target_w < 1280)
         return 0;
     if (!found_chain)
         return 0;
     *out = best;
-    stream_q = 0;          /* re-learn the slice discriminator after the join */
     return 1;
 }
 

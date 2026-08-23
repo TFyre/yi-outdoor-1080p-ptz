@@ -81,18 +81,58 @@ resort, not the next step.
   the producer's write-end call fails with EEXIST) and waits ~3 s for a
   chain when the window has none; (4) the fifo unlock thread no longer
   reads (it ate the first 1024 bytes = the stream head).
-  **Remaining:** ~1 partial-frame decode error per 10–13 s (source-side,
-  encoder slice boundaries) — was full-frame concealment on nearly every
-  P frame. The corruption source was the ring's SECOND interleaved
-  H.264 stream: its P-slices share the 9a 00 header shape and were
-  emitted alongside the target stream. Solved (commit 1677010) by
-  reverse-engineering the ring from live captures: two-pass join (dims
-  then nearest chain), chain-gated IDR/PPS, a learned pic_order_cnt byte
-  discriminator (0x90 vs 0x91), c0-table-entry head tracking, and
-  counter-delta lap detection. The transient boot-time record streams
-  (26/34-byte headers, `6a 8a 33 f?` magics) are documented but not yet
-  handled by the producer. Seed data: `tools/sps-scan.py`,
-  `tools/nalscan.py`, `tools/ringdiff.py`, `analysis/s*.bin`.
+  **Remaining:** intermittent full-frame concealment bursts under 1×
+  pacing (the ffplay case) and a multi-second end-to-end delay. Root
+  causes found and being fixed:
+  1. The ring carries **two interleaved 1080p streams** whose slices
+     share the `9a 00` header shape AND the same frame numbers; their
+     fn sequences jump when mixed (decoder "top block unavailable" +
+     full-frame conceals). They split by slice size (target stream's
+     mains ≥ 3 KB in every capture; the other's ≤ ~1.7 KB). The
+     pic_order_cnt byte was NOT a stable discriminator — it differed
+     between streams in one capture era (0x90 vs 0x91) and became
+     identical (0x92) in another; the same applies to the frame-number
+     ranges (disjoint in some eras, overlapping in others).
+  2. Lap-detection false positives under pacing: the server drains the
+     1 MB fifo in ~2.3 s bursts, so every normal block tripped the
+     1.2 s lap threshold → re-sync storm → the accumulating delay.
+     Threshold raised to ~3 s (LAP_TICKS 130).
+  3. The stream structure is era/mode-dependent (boot-time record
+     streams with 26/34-byte headers and `6a 8a 33 f?` magics vs the
+     steady-state raw Annex-B mode; P/B splits that vary per session).
+
+  **Upstream code found (2026-08, user-supplied links) — the same fshare
+  design across YI platforms:**
+  - [roleoroleo/yi-hack-Allwinner-v2 rRTSPServer.h](https://github.com/roleoroleo/yi-hack-Allwinner-v2/blob/master/src/rRTSPServer/include/rRTSPServer.h#L35):
+    `BUFFER_FILE /dev/shm/fshare_frame_buf`, read/write lock files
+    (`fshare_read_lock`/`fshare_write_lock`), stream offsets 300/368
+    (autodetect), and a **frame_header struct (20/22/24/26/28-byte
+    variants) with `len`, `counter`, `time`, `type`, `stream_counter`**.
+    The `type` flags: `0x0400` high-res video, `0x0800` low-res video,
+    `0x0100` AAC audio, `0x0002` SPS, `0x0008` VPS — the stream
+    discriminator our producer needs. Write index at buffer offset 16.
+  - [BenjaminFaal/yi-hack-Allwinner imggrabber.c](https://github.com/BenjaminFaal/yi-hack-Allwinner/blob/master/src/snapshot/snapshot/imggrabber.c#L40):
+    same buffer SIZE (1,786,156 = ours exactly), ring wraps to
+    `BUF_OFFSET 300`, and the app writes **`/tmp/iframe.idx`**: two
+    `{sps_addr, sps_len, pps_addr, pps_len, idr_addr, idr_len}` records
+    (high + low resolution) — the app's own SPS/PPS/IDR index.
+  - [run-my-job/yi-hack-Allwinner rRTSPServer.cpp](https://github.com/run-my-job/yi-hack-Allwinner/blob/master/src/rRTSPServer/src/rRTSPServer.cpp#L18):
+    the record-walking reader: walk frames via the header `len`, filter
+    by `type`, wrap-aware memcpy — the exact design to port.
+  - [roleoroleo/yi-hack-MStar system.sh](https://github.com/roleoroleo/yi-hack-MStar/blob/master/src/static/static/home/yi-hack/script/system.sh#L22):
+    frame index at buffer offset 0x1C (ours: 0x18) — same concept,
+    platform-shifted layout; each platform's header layout differs, so
+    the Fullhan layout still needs mapping from our captures.
+
+  **Next steps:** (1) check `/tmp/iframe.idx` on the unit — if the app
+  writes it, joins become exact (no chain scanning); (2) re-dump the
+  FF-record 34-byte headers and look for the `type` field matching the
+  0x0400/0x0800/0x0002 pattern (candidates: the `6a 8a 3b xx` "const"
+  or the tail u16s); (3) if the type decodes, port the record-walking
+  reader (rRTSPServer.cpp design) — exact stream selection, no
+  size-threshold heuristics, robust across the camera's mode changes.
+  Seed data: `tools/sps-scan.py`, `tools/nalscan.py`, `tools/ringdiff.py`,
+  `analysis/s*.bin`.
 - **Phase 3 — HA integration:** RTSP (generic camera) or ONVIF (minimal
   ws-discovery + SOAP service, or yi-hack's `wsd_simple_server` /
   `onvif_notify_server` if portable). PTZ does not need ONVIF: `pwmv2_fullhan`
