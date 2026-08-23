@@ -81,16 +81,18 @@ resort, not the next step.
   the producer's write-end call fails with EEXIST) and waits ~3 s for a
   chain when the window has none; (4) the fifo unlock thread no longer
   reads (it ate the first 1024 bytes = the stream head).
-  **Remaining:** ~1–2 errors/s — the ring's slice data contains
-  unescaped `00 00 01` patterns (the app tracks frames via its own
-  bookkeeping and never intended NAL-walking), so the producer splits
-  real slices mid-data. Also a table region holds per-frame entries
-  (~27-byte, `00 00 01`-prefixed, size/ts-looking fields; identical
-  across entries when the scene is static — hence the earlier "31-byte
-  periodicity" red herring). Next: reverse the table (header 0x04/0x0C
-  write positions + live correlation) and walk frames by offset instead
-  of start codes. Seed data: `tools/sps-scan.py`, `tools/nalscan.py`,
-  `analysis/fshare*.bin`.
+  **Remaining:** ~1 partial-frame decode error per 10–13 s (source-side,
+  encoder slice boundaries) — was full-frame concealment on nearly every
+  P frame. The corruption source was the ring's SECOND interleaved
+  H.264 stream: its P-slices share the 9a 00 header shape and were
+  emitted alongside the target stream. Solved (commit 1677010) by
+  reverse-engineering the ring from live captures: two-pass join (dims
+  then nearest chain), chain-gated IDR/PPS, a learned pic_order_cnt byte
+  discriminator (0x90 vs 0x91), c0-table-entry head tracking, and
+  counter-delta lap detection. The transient boot-time record streams
+  (26/34-byte headers, `6a 8a 33 f?` magics) are documented but not yet
+  handled by the producer. Seed data: `tools/sps-scan.py`,
+  `tools/nalscan.py`, `tools/ringdiff.py`, `analysis/s*.bin`.
 - **Phase 3 — HA integration:** RTSP (generic camera) or ONVIF (minimal
   ws-discovery + SOAP service, or yi-hack's `wsd_simple_server` /
   `onvif_notify_server` if portable). PTZ does not need ONVIF: `pwmv2_fullhan`

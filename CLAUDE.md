@@ -109,14 +109,28 @@ the stream head). The server side (vendored
 keeping the tail from the last complete chain, waits up to ~3 s for a
 chain, and grows the fifo to 1 MB via F_SETPIPE_SZ on its own read end
 (the producer's write-end call fails with EEXIST once other handles are
-open). Remaining corruption (~1–2/s steady + a few at join) is the
-**frame table** problem: the ring interleaves the H.264 stream with
-~31-byte-spaced table entries full of false start codes (`00 00 01 c0`
-followed by size/timestamp-looking fields) — fshare2fifo's NAL walk emits
-those regions as stream data. The table (write positions in the header at
-0x04/0x0C, entry layout) is not yet reverse-engineered; that's the next
-task, and `analysis/fshare*.bin` samples + a Python NAL-scan are the
-starting data.
+open).
+
+**Ring format (reverse-engineered from live captures, commit 1677010)**:
+the ring carries TWO interleaved H.264 streams — the target 1920×1088
+(SPS level 0x29, P-slices `41 9a 00 …`, IDRs `65 88 80 …`) and a second
+stream (SPS level 0x16; its P-slices share the `9a 00` shape and differ
+only in the pic_order_cnt byte: 0x91 vs 0x90) — plus `00 00 01 c0` table
+entries (30-byte headers with the app frame counter) and raw low-res
+frames without start codes. Mixing both streams corrupts every P frame.
+The producer therefore: two-pass joins (learn the largest stream's dims,
+then pick its nearest complete SPS→PPS→IDR chain), gates IDR/PPS on the
+chain state, learns the target stream's pic_order_cnt byte from the first
+slice after the chain and emits only matching slices, tracks the write
+head via the counter-validated c0 entries, and detects ring laps by the
+frame-counter delta across blocking fifo writes (the ring laps every ~4 s
+at ~440 KB/s; positional re-gates churn against that). Measured live:
+~1 partial-frame decode error per 10–13 s (source-side), stable 15 fps
+1080p — was full-frame concealment on nearly every P frame. Forensics
+base: `analysis/s*.bin` snapshots, `tools/ringdiff.py`. Note the ring
+format has MODES: transient boot-time record streams (26/34-byte headers
+with `6a 8a 33 f?` magics) and the steady-state raw Annex-B mode above;
+the current producer handles the steady state.
 
 ## Backup
 
