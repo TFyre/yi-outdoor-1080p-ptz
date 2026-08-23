@@ -105,15 +105,15 @@ static int have_sps;
  * yi-hack-Allwinner-v2 frame_header. Every entry-framed high-res slice
  * in the captures is >= 955 bytes (P and B frames alike, 1.2-25 KB)
  * while the low-res stream's slices are <= 475 bytes, so size splits
- * the streams: mains are emitted when >= 700 bytes, and a small slice
- * is emitted only as a twin when its frame number repeats the
- * immediately preceding main's (the low-res stream's fn runs main+0x1c
- * and never matches). The pic_order_cnt byte is NOT usable: it differed
- * between the streams in one capture era (0x90 vs 0x91) and became
- * identical (0x92) in another.
- * 0xff = no main seen yet (frame numbers observed are 0x02..0x3a). */
+ * the streams: emit slices >= 700 bytes only. The small slices are ALL
+ * the low-res stream's (a "twin slice" theory was tried and reverted:
+ * those small slices are type 0x0800 per the table, and when one's
+ * frame number happened to match a preceding main it leaked low-res
+ * data into the 1080p stream, breaking every subsequent P frame). The
+ * pic_order_cnt byte is NOT usable: it differed between the streams in
+ * one capture era (0x90 vs 0x91) and became identical (0x92) in
+ * another. */
 #define MIN_MAIN 700
-static uint8_t last_main_fn = 0xff;
 
 /* Keep the fifo open for writing without blocking forever when no reader
  * has appeared yet: a helper thread opens it read-only to unblock us, then
@@ -338,15 +338,8 @@ static int want_nal(size_t p, size_t e)
             return 0;
         if (hd[1] != 0x9a || hd[2] != 0x00)
             return 0;                 /* not a real slice of this camera */
-        if (body < MIN_MAIN) {
-            /* small slices: only the twin (its frame number repeats the
-             * preceding main's); the other stream's slices carry main+0x1c
-             * and never match */
-            if (hd[3] != last_main_fn)
-                return 0;
-        } else {
-            last_main_fn = hd[3];
-        }
+        if (body < MIN_MAIN)
+            return 0;                 /* the low-res stream's slice */
         have_sps = 0;                 /* a slice breaks the chain */
         return 1;
     }
@@ -549,8 +542,6 @@ static int find_idr_start(size_t *out)
     int found_chain = 0;
     int pass;
     uint32_t head = head_estimate();  /* once per call: the scan is costly */
-
-    last_main_fn = 0xff;   /* the drain walk re-learns from the first main */
 
     for (pass = 0; pass < 2; pass++) {
         size_t scanned = 0;

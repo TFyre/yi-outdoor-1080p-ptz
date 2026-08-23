@@ -87,12 +87,15 @@ resort, not the next step.
   1. The ring carries **two interleaved 1080p streams** whose slices
      share the `9a 00` header shape AND the same frame numbers; their
      fn sequences jump when mixed (decoder "top block unavailable" +
-     full-frame conceals). They split by slice size (target stream's
-     mains ≥ 3 KB in every capture; the other's ≤ ~1.7 KB). The
-     pic_order_cnt byte was NOT a stable discriminator — it differed
-     between streams in one capture era (0x90 vs 0x91) and became
-     identical (0x92) in another; the same applies to the frame-number
-     ranges (disjoint in some eras, overlapping in others).
+     full-frame conceals). The c0 table's TYPE field (offset 24,
+     0x0400 hi-res / 0x0800 low-res / 0x0100 audio) settles the split:
+     every hi-res slice is >= 955 bytes, every low-res slice <= 475, so
+     the producer emits slices >= 700 bytes ONLY (mains-only; the small
+     slices are ALL the low-res stream's — the "twin slice" theory was
+     reverted, it leaked 0x0800 slices when frame numbers collided).
+     The pic_order_cnt byte and the frame-number ranges are both
+     era-dependent and unusable as discriminators. ffplay 60 s:
+     0 errors, 0 conceals.
   2. Lap-detection false positives under pacing: the server drains the
      1 MB fifo in ~2.3 s bursts, so every normal block tripped the
      1.2 s lap threshold → re-sync storm → the accumulating delay.
