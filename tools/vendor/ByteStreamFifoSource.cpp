@@ -200,6 +200,17 @@ void ByteStreamFifoSource::doGetNextFrame() {
                (TaskScheduler::BackgroundHandlerProc*)&fileReadableHandler, this);
         fHaveStartedReading = True;
     }
+    // Heartbeat poll: a missed readable transition on the fifo would
+    // otherwise leave the server idle with a full fifo while the
+    // producer drops everything and the client starves - the observed
+    // mid-stream freeze (ffplay: frames stop, vq=0KB, the session stays
+    // open). The poll re-arms on every doGetNextFrame while data is
+    // awaited, so no lost wakeup can stall the stream for longer than
+    // one poll period.
+    if (nextTask() == NULL) {
+        nextTask() = envir().taskScheduler().scheduleDelayedTask(
+            200000, (TaskFunc*)&retryRead, this);
+    }
 #endif
 }
 
@@ -220,10 +231,13 @@ void ByteStreamFifoSource::fileReadableHandler(ByteStreamFifoSource* source, int
 }
 
 void ByteStreamFifoSource::retryRead(ByteStreamFifoSource* source) {
-    // Periodic fallback for the background handler: a missed readable
-    // transition on the fifo leaves the server idle with a full fifo and
-    // the producer blocked in pipe_wait (the stream stalls until another
-    // client's drain shakes it loose). Poll every 100 ms while awaiting.
+    // Periodic fallback for the background handler, armed by
+    // doGetNextFrame: a missed readable transition on the fifo leaves
+    // the server idle with a full fifo and the producer blocked in
+    // pipe_wait (the stream stalls until another client's drain shakes
+    // it loose). The EAGAIN path in doReadFromFile also chains this
+    // task every 100 ms while the fifo is empty; the heartbeat covers
+    // the transitions the handler itself misses.
     source->nextTask() = NULL;
     if (source->isCurrentlyAwaitingData())
         source->doReadFromFile();
