@@ -70,15 +70,15 @@
 
 #define BUFFER_FILE "/dev/shm/fshare_frame_buf"
 #define FRAME_COUNTER_OFFSET 0x18
-/* The writer ticks the frame counter ~43/s and laps the 1.7 MB ring in
- * ~4 s. A fifo write that blocks for this many ticks (>= ~3 s) means the
- * app kept writing while we were stuck and our read position has been
- * overwritten. The threshold must sit ABOVE the server's natural drain
- * bursts (the 1 MB fifo drains in ~2.3 s at 1x pacing): anything lower
- * fires on every normal block, and each spurious re-sync stalls the
- * stream ~1 s (full-ring chain scan) plus jumps mid-GOP - the client
- * sees full-frame conceals and an accumulating delay. */
-#define LAP_TICKS 130
+/* The writer ticks the frame counter ~43/s. A fifo write that blocks
+ * for this many ticks (>= ~1.2 s) means the client stalled; we re-sync
+ * BEFORE the writer can lap our read position (the lap needs ~3 s at
+ * the worst-case bitrate). The threshold sits ABOVE the server's
+ * natural drain bursts: with the fifo at 256 KB those last <= ~0.6 s,
+ * so normal paced writes never trip it. A larger fifo + higher
+ * threshold left a gray zone (1.6-3 s blocks) where the writer laps
+ * us without a re-sync - full-frame conceal storms. */
+#define LAP_TICKS 50
 #define DEFAULT_FIFO "/tmp/h264_high_fifo"
 #define SCAN_START 0x100          /* skip the small header */
 #define POLL_MS 10
@@ -760,14 +760,17 @@ int main(int argc, char **argv)
             perror(fifo_name);
             return 1;
         }
-        /* 1 MB fifo (kernel default is 64 KB) so a whole GOP fits in the
-         * buffered window the server's startup drain keeps to give new
-         * clients a decodable join point. On this kernel the call only
-         * works from the first reader's side; the server sets it there
-         * too, so failure here is not fatal. */
+        /* 256 KB fifo (kernel default is 64 KB): big enough for a
+         * complete SPS+PPS+IDR chain (the join window the server's
+         * startup drain keeps), small enough that the server's paced
+         * drain bursts stay well under LAP_TICKS - the lap detector
+         * then fires only on real client stalls, before the writer can
+         * overwrite our position. On this kernel the call only works
+         * from the first reader's side; the server sets it there too,
+         * so failure here is not fatal. */
         {
             int cur = fcntl(out_fd, F_GETPIPE_SZ);
-            if (fcntl(out_fd, F_SETPIPE_SZ, 1024 * 1024) != 0)
+            if (fcntl(out_fd, F_SETPIPE_SZ, 256 * 1024) != 0)
                 fprintf(stderr,
                         "F_SETPIPE_SZ failed: %s (was %d, stays %d)\n",
                         strerror(errno), cur, fcntl(out_fd, F_GETPIPE_SZ));
