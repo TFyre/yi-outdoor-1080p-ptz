@@ -353,17 +353,31 @@ static int parse_sps_dims(const uint8_t *d, size_t len, unsigned *w, unsigned *h
 
 /* Copy the NAL body (bytes after the 3-byte start code) from ring
  * position p up to the next start code e, handling the ring wrap.
- * Returns the length copied, or 0 if it does not fit in max. */
+ * Returns the length copied, or 0 if it does not fit in max.
+ * The record walk can hand p == buf_size-1 (a start code view whose
+ * last byte sits at buf_size-2): the chunked copy below handles any
+ * p/e combination, where the old two-memcpy version computed a
+ * negative first-chunk length for that case and copied garbage (one
+ * corrupt slice per ring lap - the observed per-lap decode errors). */
 static size_t copy_nal(size_t p, size_t e, uint8_t *dst, size_t max)
 {
     size_t len = (e > p) ? (e - p - 3) : ((buf_size - p - 3) + e);
+    size_t done = 0;
+    size_t q;
+
     if (len > max)
         return 0;
-    if (e > p) {
-        memcpy(dst, (const void *)(buf + p + 3), len);
-    } else {
-        memcpy(dst, (const void *)(buf + p + 3), buf_size - p - 3);
-        memcpy(dst + buf_size - p - 3, (const void *)buf, e);
+    q = p + 3;
+    while (done < len) {
+        size_t n;
+        if (q >= buf_size)
+            q -= buf_size;
+        n = buf_size - q;
+        if (n > len - done)
+            n = len - done;
+        memcpy(dst + done, (const void *)(buf + q), n);
+        done += n;
+        q += n;
     }
     return len;
 }
@@ -1317,9 +1331,9 @@ static int emit_nal(size_t s, size_t e)
          * whole-or-drop write (write_whole_fd); chains (SPS/PPS/IDR)
          * wait for fifo space - see write_all_fd_wait. */
         memcpy(nal_copy, start4, sizeof(start4));
-        if ((buf[s + 3] & 0x1F) == 5 ||
-            (buf[s + 3] & 0x1F) == 7 ||
-            (buf[s + 3] & 0x1F) == 8) {
+        if ((rb((int64_t)s + 3) & 0x1F) == 5 ||
+            (rb((int64_t)s + 3) & 0x1F) == 7 ||
+            (rb((int64_t)s + 3) & 0x1F) == 8) {
             r = write_all_fd_wait(out_fd, nal_copy, len + 4);
             if (r != 0)
                 return r;
@@ -1341,19 +1355,18 @@ static int emit_nal(size_t s, size_t e)
         return 0;
     }
 
-    /* file mode: blocking stdio */
-    if (fwrite(start4, 1, sizeof(start4), out) != sizeof(start4))
-        return -2;
-    if (e > s) {
-        if (fwrite((const void *)(buf + s + 3), e - s - 3, 1, out) != 1)
+    /* file mode: blocking stdio. The same wrap boundary as copy_nal
+     * (s can be buf_size-1 from the record walk), so normalize the
+     * source through the wrap-safe copy and write from there. */
+    {
+        size_t len = copy_nal(s, e, nal_copy + 4, NAL_COPY_MAX);
+        if (len == 0)
             return -2;
-    } else {
-        if (fwrite((const void *)(buf + s + 3), buf_size - s - 3, 1, out) != 1)
+        memcpy(nal_copy, start4, sizeof(start4));
+        if (fwrite(nal_copy, 1, len + 4, out) != len + 4)
             return -2;
-        if (e > 0 && fwrite((const void *)buf, e, 1, out) != 1)
-            return -2;
+        fflush(out);
     }
-    fflush(out);
     return 0;
 }
 
