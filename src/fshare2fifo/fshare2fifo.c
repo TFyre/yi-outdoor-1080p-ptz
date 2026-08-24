@@ -698,6 +698,511 @@ static size_t dist_to_head_cached(size_t pos, uint32_t head)
     return (size_t)h + buf_size - pos;
 }
 
+/* ---- record-mode walk (reverse-engineered from live snapshots,
+ * 2026-08-24: analysis/rs1.bin + rs2.bin, ring in record mode) ---- */
+/* emit_nal lives further down; the record walk calls it per slice. */
+static int emit_nal(size_t s, size_t e);
+/* The app's record framing: every record is a header + an H.264 NAL
+ * with a 4-byte start code. Header layout (all little-endian):
+ *
+ *   [0:2]   u16     (ignored)
+ *   [2:6]   counter u32   increments by 1 per record (all types share
+ *                         one sequence); lags the 0x18 frame counter
+ *                         by a few ticks
+ *   [6:10]  magic   u32   0x6a8c02xx / 0x6a8c03xx (mask 0xffff0000 ==
+ *                         0x6a8c0000); the low byte is a writer
+ *                         sequence, not a class - classify by TYPE
+ *   [10:14] u32     (0 for frames, 0xa699c601 for chains)
+ *   [14:18] ts      u32
+ *   [18:20] type    u16   0x0400 hi-res frame / 0x0800 low-res frame /
+ *                         0x0100 audio frame / 0x0422 hi SPS#1 /
+ *                         0x0401 hi SPS#2 / 0x0404 hi PPS /
+ *                         0x0822,0x0801,0x0804 = the low-res chain
+ *   [20:22] sub     u16
+ *   frames:  [22:24] 00 00, 4-byte SC at +24, NAL header at +28
+ *            (audio: no SC - raw AAC payload at +26)
+ *   chains:  SPS#1 (0x?22): prefix 00 00 01 0f 80 02 68 01, SC at +30
+ *            SPS#2 (0x?01) / PPS (0x?04): 00 00, SC at +24
+ *
+ * The IDR is NOT record-framed: after the SPS#2 record's NAL it follows
+ * RAW (a PPS NAL, ~20 zero bytes, then the IDR NAL) until the next
+ * record starts. The chain per GOP: SPS#1 -> PPS rec -> SPS#2 rec ->
+ * raw PPS -> raw IDR. Verified live: the newest record's position is
+ * the writer's head (it advances exactly with the ring-diff writer) and
+ * a forward magic scan finds the next record from any record (394/400
+ * in the snapshot). The ring switches between this framing and the raw
+ * Annex-B/c0 mode mid-uptime; the freshness check below picks the mode.
+ */
+#define REC_MAGIC_MASK  0xffff0000u
+#define REC_MAGIC       0x6a8c0000u
+#define REC_SCAN_LIM    (512u * 1024)  /* > the raw-IDR gap at night bitrates */
+
+static uint8_t rb(int64_t i)     /* wrap-safe ring byte (one lap each way) */
+{
+    if (i < 0)
+        i += (int64_t)buf_size;
+    if (i >= (int64_t)buf_size)
+        i -= (int64_t)buf_size;
+    return buf[i];
+}
+
+static int rec_type_ok(uint16_t t)
+{
+    switch (t) {
+    case 0x0400: case 0x0800: case 0x0100:
+    case 0x0422: case 0x0401: case 0x0404:
+    case 0x0822: case 0x0801: case 0x0804:
+        return 1;
+    }
+    return 0;
+}
+
+/* Byte offset of the record's 4-byte start code in its header: 24 for
+ * everything except SPS#1 (30, after its 8-byte prefix). Audio records
+ * carry no start code (raw AAC at +26) and are never scanned for one. */
+static unsigned rec_sc_offset(uint16_t t)
+{
+    switch (t) {
+    case 0x0422: case 0x0822:
+        return 30;
+    default:
+        return 24;
+    }
+}
+
+/* Cheap magic pre-check: the 0x6a8c0000 mask's two fixed LE bytes. */
+static int rec_magic_at(size_t p)
+{
+    return rb(p + 8) == 0x8c && rb(p + 9) == 0x6a;
+}
+
+/* A record header at p is valid for reading: magic + type + (for the
+ * video types) the 4-byte start code at the type's offset. Audio
+ * records carry raw AAC (no start code), so they validate on the
+ * header alone. Callers pre-check with rec_magic_at (the hot scans run
+ * it per byte; this full validation only runs on magic hits). */
+static int rec_valid(size_t p, uint32_t *cnt_out, uint16_t *type_out)
+{
+    uint8_t hdr[22];                 /* p .. p+21 (through the sub field) */
+    uint8_t sc[8];
+    uint32_t m, c;
+    uint16_t t;
+    unsigned off;
+
+    if (!rec_magic_at(p))
+        return 0;
+    copy_nal_head(p - 3, hdr, sizeof(hdr));   /* wrap-safe: hdr[i] = rb(p+i) */
+    memcpy(&c, hdr + 2, 4);
+    memcpy(&m, hdr + 6, 4);
+    memcpy(&t, hdr + 18, 2);
+    if ((m & REC_MAGIC_MASK) != REC_MAGIC)
+        return 0;
+    if (!rec_type_ok(t))
+        return 0;
+    if (t != 0x0100) {
+        off = rec_sc_offset(t);
+        copy_nal_head(p + off - 3, sc, 8);    /* rb(p+off) .. +7 */
+        if (sc[0] != 0x00 || sc[1] != 0x00 || sc[2] != 0x00 || sc[3] != 0x01)
+            return 0;
+    } else if (rb(p + 22) != 0x00 || rb(p + 23) != 0x00 ||
+               rb(p + 24) != 0xff || rb(p + 25) != 0xf9) {
+        /* The audio records' fixed tail (00 00 ff f9, verified across
+         * all captures): without it, a false audio match in slice
+         * entropy truncates the real slice at the match and the walk
+         * desyncs silently (the observed -19/-5 bytestream decode
+         * errors). */
+        return 0;
+    }
+    if (cnt_out)
+        *cnt_out = c;
+    if (type_out)
+        *type_out = t;
+    return 1;
+}
+
+/* Bounded forward scan for the next valid record at/after *p (wrapping)
+ * whose counter is above min_cnt: old-lap records (previous writes of
+ * the same ring region) carry lower counters and are skipped, which is
+ * what keeps the walk on the current lap. */
+static int rec_next(size_t *p, uint32_t min_cnt,
+                    uint32_t *cnt_out, uint16_t *type_out)
+{
+    size_t q = *p;
+    size_t scanned = 0;
+
+    while (scanned < REC_SCAN_LIM) {
+        uint32_t c;
+        uint16_t t;
+
+        if (q >= buf_size)
+            q = 0;                    /* wrap */
+        if (rec_magic_at(q) && rec_valid(q, &c, &t)) {
+            if (c > min_cnt) {
+                *p = q;
+                if (cnt_out)
+                    *cnt_out = c;
+                if (type_out)
+                    *type_out = t;
+                return 1;
+            }
+        }
+        q++;
+        scanned++;
+    }
+    return 0;
+}
+
+/* Tracked newest record (the writer's head in record mode): a small
+ * forward scan from the last one catches the next record as soon as
+ * the writer completes it; a full-ring rescan on repeated stalls
+ * recovers from a lost track (same pattern as the c0 tracker). The
+ * newest record's START is the completeness line: its own slice may be
+ * in flight, everything before it is final.
+ *
+ * The record counter (strictly +1 per record, verified across all
+ * snapshots) is the only reliable clock here: the 0x18 frame counter
+ * races and wraps BACKWARD mid-era (verified live), so no freshness or
+ * ordering check may be built on it. Freshness is wall-clock time of
+ * the last head advance instead (see record_head_fresh below). */
+static uint32_t rec_head_pos;        /* newest record start (0 = none yet) */
+static uint32_t rec_head_cnt;        /* its counter */
+static unsigned rec_head_misses;     /* forward scans without progress */
+static struct timespec rec_head_when; /* wall time of the last advance */
+static volatile int rec_head_reset;  /* the app reset its counter era:
+                                        the caller re-anchors the walk */
+
+#define REC_HEAD_WIN    (16u * 1024) /* cheap forward probe per call */
+#define REC_HEAD_STALL  8            /* misses before a full-ring rescan */
+#define REC_FRESH_SEC   5            /* records stale after 5 s idle */
+/* A backward jump of the newest record's counter this large is a
+ * counter-era reset (the app restarts its encoder mid-uptime, verified
+ * live: 126K -> 10K, and smaller ~10-100K drops in the hyperactive
+ * state). Old-lap records sit at most a few thousand records behind,
+ * so anything bigger is a reset. If the drop is missed, the stale
+ * era's high counters keep winning the max-counter rescans forever:
+ * the head freezes on an old position, the walk passes it, and the
+ * wrapped distance (~1.7 MB) trips MAX_LAG in a loop (verified live). */
+#define RESET_GAP       10000u
+
+static void rec_head_adopt(uint32_t pos, uint32_t cnt)
+{
+    if (cnt > rec_head_cnt || rec_head_cnt - cnt > RESET_GAP) {
+        if (f2f_trace())
+            fprintf(stderr, "adopt: 0x%x/%u <- 0x%x/%u (gap %d)\n",
+                    (unsigned)pos, (unsigned)cnt,
+                    (unsigned)rec_head_pos, (unsigned)rec_head_cnt,
+                    (int)(rec_head_cnt - cnt));
+        if (rec_head_cnt != 0 && cnt < rec_head_cnt)
+            rec_head_reset = 1;      /* era change: re-anchor the walk */
+        rec_head_cnt = cnt;
+        rec_head_pos = pos;
+        clock_gettime(CLOCK_MONOTONIC, &rec_head_when);
+    }
+}
+
+static uint32_t record_head(void)
+{
+    size_t p = rec_head_pos;
+    size_t scanned = 0;
+
+    if (rec_head_pos != 0) {
+        uint32_t best = rec_head_pos, best_c = rec_head_cnt;
+        while (scanned < REC_HEAD_WIN) {
+            uint32_t c;
+            if (rec_magic_at(p) && rec_valid(p, &c, NULL) &&
+                c > best_c) {
+                best_c = c;
+                best = (uint32_t)p;
+            }
+            p++;
+            if (p >= buf_size)
+                p = 0;
+            scanned++;
+        }
+        if (best_c > rec_head_cnt) {
+            /* Adopt the NEWEST record seen in the window, not the
+             * first: adopting only +1 per call made the head lag the
+             * writer's ~1000 records/s (33/s) and the walk passed the
+             * stale head - the wrapped distance then tripped MAX_LAG
+             * in a loop (verified live). */
+            rec_head_adopt(best, best_c);
+            rec_head_misses = 0;
+            return rec_head_pos;
+        }
+    }
+    if (rec_head_pos == 0 || ++rec_head_misses > REC_HEAD_STALL) {
+        uint32_t best = 0, best_c = 0;
+        for (p = SCAN_START; p + 26 <= buf_size; p++) {
+            uint32_t c;
+            if (rec_magic_at(p) && rec_valid(p, &c, NULL) &&
+                c > best_c) {
+                best_c = c;
+                best = (uint32_t)p;
+            }
+        }
+        if (f2f_trace())
+            fprintf(stderr, "rec: rescan best=0x%x cnt=%u "
+                    "(was 0x%x cnt %u)\n",
+                    (unsigned)best, (unsigned)best_c,
+                    (unsigned)rec_head_pos, (unsigned)rec_head_cnt);
+        /* rec_head_adopt never moves the head backward unless the
+         * counter era reset (RESET_GAP): the walk's own updates (see
+         * drain_record_round) are at least as fresh as any scan. */
+        rec_head_adopt(best, best_c);
+        rec_head_misses = 0;
+    }
+    return rec_head_pos;             /* 0 when no records anywhere */
+}
+
+/* Records are fresh while the tracked newest record keeps advancing:
+ * wall-clock based, so any record rate and the unreliable 0x18 counter
+ * cannot misjudge it. */
+static int record_head_fresh(void)
+{
+    struct timespec now;
+
+    if (rec_head_pos == 0)
+        return 0;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return now.tv_sec - rec_head_when.tv_sec < REC_FRESH_SEC;
+}
+
+/* The newest COMPLETE chain's SPS#1 record: walk back from the newest
+ * record (its existence proves everything before it is final) to the
+ * SPS#2 record across the raw-IDR gap, then back to the SPS#1 a few
+ * dozen bytes before it. The join starts there so the walk emits a full
+ * SPS -> PPS -> SPS -> PPS -> IDR chain for every client. */
+static int rec_find_chain_start(size_t *out)
+{
+    uint32_t h = rec_head_pos;
+    size_t p;
+    size_t scanned = 0;
+
+    if (h == 0)
+        return 0;
+    p = h;
+    while (scanned < REC_SCAN_LIM) {
+        uint32_t c;
+        uint16_t t;
+        if (p == 0)
+            p = buf_size - 1;
+        if (rec_valid(p, &c, &t) && t == 0x0401 &&
+            rec_head_cnt - c < 4000) {
+            /* SPS#2 of the CURRENT lap found (old-lap chains are
+             * thousands of records behind and skipped): the SPS#1 sits
+             * right before the PPS record a few dozen bytes back. */
+            size_t q = p;
+            size_t back = 0;
+            while (back < 512) {
+                uint32_t c2;
+                uint16_t t2;
+                if (q == 0)
+                    q = buf_size - 1;
+                if (rec_valid(q, &c2, &t2) && t2 == 0x0422) {
+                    /* learn the target dims from the chain's SPS so the
+                     * join prints and gates are right from the start */
+                    size_t sc2 = q + 30, q2 = q + 1;
+                    unsigned w = 0, h = 0;
+                    uint8_t sps_buf[NAL_BUF_MAX];
+                    if (sc2 >= buf_size)
+                        sc2 -= buf_size;
+                    if (rec_next(&q2, c2, NULL, NULL)) {
+                        size_t len = copy_nal(sc2 + 1, q2, sps_buf,
+                                              sizeof(sps_buf));
+                        if (len && parse_sps_dims(sps_buf, len, &w, &h)) {
+                            if ((uint64_t)w * h >
+                                (uint64_t)target_w * target_h) {
+                                target_w = w;
+                                target_h = h;
+                            }
+                        }
+                    }
+                    *out = q;
+                    return 1;
+                }
+                q--;
+                back++;
+            }
+            return 0;                /* chain torn: no SPS#1 before it */
+        }
+        p--;
+        scanned++;
+    }
+    return 0;
+}
+
+/* Find the next 4-byte start code at/after *p (wrapping): the ring's
+ * record mode writes 4-byte codes throughout; a 3-byte view directly
+ * after a 00 byte is treated as the tail of a 4-byte code. */
+static int next_sc4(size_t *p)
+{
+    size_t q = *p;
+    size_t scanned = 0;
+
+    while (scanned < buf_size) {
+        if (q >= buf_size)
+            q = 0;
+        if (q + 4 <= buf_size && rb(q) == 0x00 && rb(q + 1) == 0x00 &&
+            rb(q + 2) == 0x00 && rb(q + 3) == 0x01) {
+            *p = q;
+            return 1;
+        }
+        q++;
+        scanned++;
+    }
+    return 0;
+}
+
+/* One record-walk round: advance *pos through record-framed content,
+ * emitting the hi-res stream's slices with EXACT boundaries (no header
+ * junk) and the chain NALs with the same SPS->PPS->IDR gating as the
+ * NAL walk. A record's slice is emitted only when its successor record
+ * exists - the successor IS the completeness proof, so the positional
+ * gate is structural here. The raw PPS+IDR after an SPS#2 record is
+ * NAL-walked with the IDR ending at the next record start.
+ * Returns 0, 2 (hard error), or 3 (counter desync: caller re-joins). */
+static int drain_record_round(size_t *pos, int force)
+{
+    int i;
+    static unsigned tr;
+    if (f2f_trace() && ++tr % 100 == 0)
+        fprintf(stderr, "drr: enter pos=0x%zx i-loops so far %u\n",
+                *pos, tr);
+
+    (void)force;   /* completeness is the successor record's existence */
+    for (i = 0; i < 256; i++) {
+        size_t p = *pos, q, sc, sc1;
+        uint32_t cnt, cnt2;
+        uint16_t t, t2;
+
+        if (!rec_next(&p, 0, &cnt, &t)) {
+            if (f2f_trace() && ++tr % 100 == 0)
+                fprintf(stderr, "drr: ret-no-record pos=0x%zx\n", *pos);
+            return 0;                /* no record in range */
+        }
+        q = p + 1;
+        if (!rec_next(&q, cnt, &cnt2, &t2)) {
+            /* The successor-less record IS the write head: its own
+             * slice may be in flight, everything before it is final.
+             * The walk itself tracks the head this way - no separate
+             * scan can outpace the writer or lag behind the walk (a
+             * lagging scan made dist go negative-wrapped and MAX_LAG
+             * fire in a loop; verified live). Only a counter advance
+             * refreshes the freshness clock, so a writer that stops
+             * writing records still goes stale. */
+            rec_head_adopt((uint32_t)p, cnt);
+            if (f2f_trace() && ++tr % 100 == 0)
+                fprintf(stderr, "drr: ret-newest p=0x%zx cnt=%u pos=0x%zx\n",
+                        p, cnt, *pos);
+            return 0;
+        }
+        if (cnt2 - cnt > 8) {
+            if (f2f_trace())
+                fprintf(stderr, "drr: DESYNC p=0x%zx cnt=%u next=%u\n",
+                        p, cnt, cnt2);
+            return 3;                /* counter jump: false match or the
+                                       writer lapped us - re-join */
+        }
+        sc = p + rec_sc_offset(t);
+        if (sc >= buf_size)
+            sc -= buf_size;
+        sc1 = (sc + 1 >= buf_size) ? 0 : sc + 1;  /* the 3-byte SC view */
+
+        switch (t) {
+        case 0x0400: {               /* hi-res frame slice */
+            int r;
+            if (!emit_mode) {
+                *pos = q;
+                continue;
+            }
+            r = emit_nal(sc1, q);
+            if (r == -1)
+                g_drops++;           /* full fifo: drop whole, keep walking */
+            else if (r != 0)
+                return 2;
+            break;
+        }
+        case 0x0422: {               /* hi-res SPS#1 */
+            unsigned w = 0, h = 0;
+            uint8_t sps_buf[NAL_BUF_MAX];
+            size_t len = copy_nal(sc1, q, sps_buf, sizeof(sps_buf));
+            if (len == 0 || !parse_sps_dims(sps_buf, len, &w, &h))
+                break;               /* unparseable: not a real SPS */
+            if ((uint64_t)w * h > (uint64_t)target_w * target_h) {
+                target_w = w;
+                target_h = h;
+            }
+            emit_mode = 1;
+            have_sps = 1;
+            if (emit_nal(sc1, q) != 0)
+                return 2;
+            break;
+        }
+        case 0x0401: {               /* hi-res SPS#2 + raw PPS + raw IDR */
+            size_t pps_sc = sc + 4, idr_sc = 0;
+            size_t pps1, idr1;
+            uint8_t hd[3];
+            uint8_t nal;
+
+            if (!emit_mode)
+                break;               /* no accepted SPS#1 before it */
+            /* The chain tail is emitted only when it is fully present
+             * (the IDR's end = the next record q), so a torn chain
+             * never emits a duplicate on retry. */
+            if (!next_sc4(&pps_sc)) {
+                if (f2f_trace())
+                    fprintf(stderr, "drr: no pps_sc p=0x%zx\n", p);
+                return 0;
+            }
+            idr_sc = pps_sc + 1;
+            if (!next_sc4(&idr_sc)) {
+                if (f2f_trace())
+                    fprintf(stderr, "drr: no idr_sc p=0x%zx\n", p);
+                return 0;
+            }
+            if (copy_nal_head(idr_sc + 1, hd, 3) < 3 ||
+                hd[1] != 0x88 || hd[2] != 0x80) {
+                if (f2f_trace())
+                    fprintf(stderr, "drr: idr shape %02x %02x %02x "
+                            "p=0x%zx\n", hd[0], hd[1], hd[2], p);
+                return 0;            /* not our IDR shape: wait/desync */
+            }
+            if (emit_nal(sc1, pps_sc) != 0)
+                return 2;
+            have_sps = 1;            /* the SPS restarts the chain */
+            nal = rb(pps_sc + 4) & 0x1F;
+            if (nal != 8)
+                break;               /* raw PPS missing: skip the tail */
+            pps1 = (pps_sc + 1 >= buf_size) ? 0 : pps_sc + 1;
+            if (emit_nal(pps1, idr_sc) != 0)
+                return 2;
+            have_sps = 2;
+            nal = rb(idr_sc + 4) & 0x1F;
+            if (nal != 5)
+                break;
+            idr1 = (idr_sc + 1 >= buf_size) ? 0 : idr_sc + 1;
+            if (emit_nal(idr1, q) != 0)
+                return 2;
+            have_sps = 0;
+            if (just_joined == 1)
+                just_joined = 2;     /* join chain out: caller jumps */
+            break;
+        }
+        case 0x0404:                 /* hi-res PPS */
+            if (have_sps != 1)
+                break;
+            if (emit_nal(sc1, q) != 0)
+                return 2;
+            have_sps = 2;
+            break;
+        default:                     /* 0x0800/0x08xx/0x0100: other streams */
+            break;
+        }
+        *pos = q;
+    }
+    return 0;
+}
+
 /* Blocking write for CHAIN NALs (SPS/PPS/IDR): the paced writer's
  * ~10 ms grace hits the biggest NALs hardest - an IDR keyframe
  * (~100 KB) cannot squeeze into a full fifo within the budget, and a
@@ -709,10 +1214,19 @@ static size_t dist_to_head_cached(size_t pos, uint32_t head)
 static int write_all_fd_wait(int fd, const void *p, size_t n)
 {
     const uint8_t *b = p;
+    unsigned retries = 0;
     while (n > 0) {
         ssize_t w = write(fd, b, n);
         if (w < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                if (f2f_trace() && ++retries % 1000 == 0) {
+                    int fill = 0;
+                    ioctl(fd, FIONREAD, &fill);
+                    fprintf(stderr, "chainwait: n=%u retries=%u fill=%d "
+                            "cap=%d errno=%d\n",
+                            (unsigned)n, retries, fill,
+                            fcntl(fd, F_GETPIPE_SZ), errno);
+                }
                 usleep(2000);
                 continue;
             }
@@ -768,7 +1282,11 @@ static int write_whole_fd(int fd, const void *p, size_t n)
  * the next clean one (full-frame conceal storms). Writing a private
  * copy also lets the lap check run only after the NAL is complete, so
  * a re-sync never abandons a half-written NAL either. */
-#define NAL_COPY_MAX (192u * 1024)
+/* At the IR-noise / active bitrates a single IDR exceeds 192 KB (the
+ * night chains measured 300-500 KB); a smaller cap killed the producer
+ * with "implausibly large NAL" on the biggest keyframes. The fifo is
+ * 1 MB (see the pipe probe in main), so a 512 KB NAL still fits whole. */
+#define NAL_COPY_MAX (512u * 1024)
 static uint8_t nal_copy[NAL_COPY_MAX + 4];  /* + 4-byte start code prefix */
 
 /* Emit one NAL (ring positions s..e) as 4-byte start code + body,
@@ -858,7 +1376,12 @@ static int find_idr_start(size_t *out)
     size_t chain_start = 0;
     int found_chain = 0;
     int pass;
-    uint32_t head = head_estimate(NULL);  /* once per call: the scan is costly */
+    /* The record-mode head is authoritative when records are fresh (the
+     * c0/slot signals are dead there - verified live: the slots froze at
+     * the buffer end while the writer moved on). */
+    uint32_t head = record_head();
+    if (head == 0 || !record_head_fresh())
+        head = head_estimate(NULL);  /* once per call: the scan is costly */
 
     for (pass = 0; pass < 2; pass++) {
         size_t scanned = 0;
@@ -968,6 +1491,23 @@ static int drain_round(size_t *pos, uint32_t head, int force)
         e = s + 4;
         if (!next_sc(&e, 0) || e == s) /* no complete NAL yet */
             return 0;
+        /* The ring's record-framed content: the next start code's view
+         * sits at record+26, so the copy above would append the next
+         * record's 25-byte header to the slice - the junk gave the
+         * decoder "cabac decode of qscale diff failed" / truncated
+         * bytestreams on every mode-flip era. When the bytes before
+         * the next SC hold a record header (magic at SC-18, type at
+         * SC-8), end the slice at the record start instead. */
+        if (rb((int64_t)e - 18) == 0x8c && rb((int64_t)e - 17) == 0x6a) {
+            uint16_t rt = (uint16_t)(rb((int64_t)e - 8) |
+                                     (rb((int64_t)e - 7) << 8));
+            if (rec_type_ok(rt)) {
+                if (e >= 26)
+                    e -= 26;
+                else
+                    e += buf_size - 26;   /* record start wraps */
+            }
+        }
         len = (e > s) ? (e - s - 3) : (buf_size - s - 3 + e);
         if (!force) {
             if (head != 0) {
@@ -1011,11 +1551,52 @@ static void drain_forever(void)
     size_t pos = stream_base;
     time_t next_log = 0;
     int head_was_dead = 0;
+    int rec_mode = 0;
     just_joined = 1;
 
     while (1) {
-        uint32_t head = update_head();
+        uint32_t head = update_head();   /* c0/slot/diff (raw Annex-B mode) */
+        uint32_t rhead = record_head();  /* 0 when the ring has no records */
+        int rec_now = record_head_fresh();
         int r;
+        static unsigned hb;
+        if (f2f_trace() && ++hb % 33 == 0)
+            fprintf(stderr, "hb: loop %u pos=0x%zx jj=%d mode=%d now=%d "
+                    "rhead=0x%x rcnt=%u nals=%u\n",
+                    hb, pos, just_joined, rec_mode, rec_now,
+                    (unsigned)rhead, (unsigned)rec_head_cnt, g_nals);
+
+        if (f2f_trace() && (!rec_now || rec_now != rec_mode)) {
+            fprintf(stderr,
+                    "rec: rhead=0x%x rcnt=%u fctr=%u rec_now=%d "
+                    "rec_mode=%d\n",
+                    (unsigned)rhead, (unsigned)rec_head_cnt,
+                    (unsigned)frame_counter(), rec_now, rec_mode);
+        }
+        if (rec_head_reset) {
+            /* The app restarted its counter era: the old walk position
+             * belongs to a dead epoch - re-anchor at the new era's
+             * newest chain. */
+            rec_head_reset = 0;
+            if (rec_find_chain_start(&pos)) {
+                usleep(1000 * 1000);
+                just_joined = 1;
+                fprintf(stderr, "era-reset: chain at 0x%zX\n", pos);
+            }
+        }
+
+        if (rec_now)
+            head = rhead;            /* the record walk's own head */
+        if (rec_now && !rec_mode) {
+            /* The ring switched into record framing: re-anchor at the
+             * newest complete chain before walking it. */
+            if (rec_find_chain_start(&pos)) {
+                usleep(1000 * 1000);
+                just_joined = 1;
+                fprintf(stderr, "mode->record: chain at 0x%zX\n", pos);
+            }
+        }
+        rec_mode = rec_now;
 
         if (f2f_agelog()) {
             time_t t = time(NULL);
@@ -1023,20 +1604,41 @@ static void drain_forever(void)
                 fprintf(stderr,
                         "age: pos=0x%zx head=0x%x dist=%zu nals=%u "
                         "bytes=%u block_ticks=%u max_block=%u drops=%u "
-                        "fctr=%u\n",
+                        "fctr=%u mode=%s\n",
                         pos, head, dist_to_head_cached(pos, head),
                         g_nals, g_bytes, g_block_ticks, g_max_block,
-                        g_drops, frame_counter());
+                        g_drops, frame_counter(),
+                        rec_mode ? "rec" : "nal");
                 g_nals = g_bytes = g_block_ticks = g_max_block =
                     g_drops = 0;
                 next_log = t + 1;
             }
         }
 
-        r = drain_round(&pos, head, 0);
+        if (rec_mode)
+            r = drain_record_round(&pos, 0);
+        else
+            r = drain_round(&pos, head, 0);
+        if (rec_mode)
+            head = rec_head_pos;     /* the walk's own adopt advanced the
+                                       head during the drain; the checks
+                                       below must compare against it,
+                                       not the pre-drain scan value */
         if (r == 2) {
             perror("write");
             return;
+        }
+        if (r == 3) {
+            /* Record counter desync: a false successor or the writer
+             * lapped the walk - re-join at the newest chain. */
+            if (rec_find_chain_start(&pos)) {
+                usleep(1000 * 1000);
+                just_joined = 1;
+                fprintf(stderr, "re-join: record chain at 0x%zX\n", pos);
+            } else {
+                usleep(200 * 1000);
+            }
+            continue;
         }
         if (head == 0) {
             /* Dead position signal: the heartbeat gate ran the walk
@@ -1051,7 +1653,8 @@ static void drain_forever(void)
             /* The signal recovered while the walk roamed blind: its
              * position is meaningless - re-join at the newest chain. */
             head_was_dead = 0;
-            if (find_idr_start(&pos)) {
+            if ((rec_mode && rec_find_chain_start(&pos)) ||
+                (!rec_mode && find_idr_start(&pos))) {
                 usleep(1000 * 1000);
                 just_joined = 1;
                 fprintf(stderr, "re-join: IDR start at 0x%zX\n", pos);
@@ -1066,7 +1669,11 @@ static void drain_forever(void)
              * re-join at the newest chain BEFORE emitting anything -
              * a backlog sprint here serves old content to a fresh
              * client. */
-            if (find_idr_start(&pos)) {
+            if (f2f_trace())
+                fprintf(stderr, "maxlag: pos=0x%zx head=0x%x dist=%zu\n",
+                        pos, head, dist_to_head_cached(pos, head));
+            if ((rec_mode && rec_find_chain_start(&pos)) ||
+                (!rec_mode && find_idr_start(&pos))) {
                 usleep(1000 * 1000);
                 just_joined = 1;
                 fprintf(stderr, "re-join: IDR start at 0x%zX\n", pos);
@@ -1163,32 +1770,52 @@ int main(int argc, char **argv)
          * keeps the write end from EPIPE; see fifo_purger_thread. */
         pthread_create(&unlock_thread, NULL, fifo_purger_thread,
                        (void *)fifo_name);
-        /* NON-BLOCKING writer: a full fifo must make emit_nal DROP the
-         * NAL (and stay glued to the writer), never block - blocking
-         * here is what let the walk fall behind during idle periods
-         * and served the next client a backlog sprint. */
-        out_fd = open(fifo_name, O_WRONLY);
-        if (out_fd < 0) {
-            perror(fifo_name);
-            return 1;
+        /* Grow the fifo to 1 MB BEFORE any writer opens it: a complete
+         * SPS+PPS+IDR chain must fit WHOLE. At the IR-noise bitrate the
+         * chain is 300-500 KB - bigger than the old 256 KB fifo - so
+         * the chain write dribbled in as the client drained, blocking
+         * the walk for ~1 s per GOP (the walk lagged hundreds of KB
+         * and the MAX_LAG re-joins looped - the conceal storms).
+         * F_SETPIPE_SZ fails once other handles are open or the pipe
+         * holds data, so this probe - opened before the write end
+         * exists - is the only moment it can work. Its fd stays open
+         * until the write end exists below: between the probe's close
+         * and the write open, the fifo can have ZERO handles (the
+         * purger's blocked open only completes once a writer opens,
+         * and the server opens the fifo at the first DESCRIBE), which
+         * frees the pipe inode and the 1 MB dies with it - measured
+         * live: the chain write then wedged forever in EAGAIN at the
+         * default 64 KB capacity. */
+        {
+            int pf = open(fifo_name, O_RDONLY | O_NONBLOCK);
+            if (pf >= 0) {
+                int ps = fcntl(pf, F_SETPIPE_SZ, 1024 * 1024);
+                fprintf(stderr, "pipe probe: set 1MB -> %d (%s)\n",
+                        ps, ps != 0 ? strerror(errno) : "ok");
+                /* NON-BLOCKING writer: a full fifo must make emit_nal
+                 * DROP the NAL (and stay glued to the writer), never
+                 * block - blocking here is what let the walk fall
+                 * behind during idle periods and served the next
+                 * client a backlog sprint. */
+                out_fd = open(fifo_name, O_WRONLY);
+                close(pf);           /* the write end keeps the pipe alive */
+                if (out_fd < 0) {
+                    perror(fifo_name);
+                    return 1;
+                }
+            } else {
+                fprintf(stderr, "pipe probe: open failed (%s)\n",
+                        strerror(errno));
+                out_fd = open(fifo_name, O_WRONLY);
+                if (out_fd < 0) {
+                    perror(fifo_name);
+                    return 1;
+                }
+            }
         }
         fcntl(out_fd, F_SETFL, fcntl(out_fd, F_GETFL, 0) | O_NONBLOCK);
-        /* 256 KB fifo (kernel default is 64 KB): big enough for a
-         * complete SPS+PPS+IDR chain (the join window the server's
-         * startup drain keeps), small enough to keep the end-to-end
-         * latency near one GOP. On this kernel the call only works
-         * from the first reader's side; the server sets it there too,
-         * so failure here is not fatal. */
         {
             int cur = fcntl(out_fd, F_GETPIPE_SZ);
-            if (fcntl(out_fd, F_SETPIPE_SZ, 256 * 1024) != 0)
-                fprintf(stderr,
-                        "F_SETPIPE_SZ failed: %s (was %d, stays %d)\n",
-                        strerror(errno), cur, fcntl(out_fd, F_GETPIPE_SZ));
-            else
-                fprintf(stderr, "F_SETPIPE_SZ ok: %d\n",
-                        fcntl(out_fd, F_GETPIPE_SZ));
-            cur = fcntl(out_fd, F_GETPIPE_SZ);
             if (cur > 0)
                 g_pipe_size = (size_t)cur;   /* the whole-or-drop budget */
         }
@@ -1197,9 +1824,18 @@ int main(int argc, char **argv)
     /* Wait for a decodable start point: a complete SPS->PPS->IDR chain of
      * the target stream. The ring holds ~1.7 MB (a few seconds of
      * video), so once the app is writing, a chain appears within one GOP
-     * interval; give it up to ~30 s. */
+     * interval; give it up to ~30 s. In the record mode the join walks
+     * back from the newest record (the existence of the successor proves
+     * the chain complete); the NAL scan covers the raw Annex-B mode. */
     stream_base = SCAN_START;
-    for (i = 0; !find_idr_start(&stream_base); i++) {
+    for (i = 0; ; i++) {
+        int ok = 0;
+        if (record_head() != 0 && record_head_fresh())
+            ok = rec_find_chain_start(&stream_base);
+        else
+            ok = find_idr_start(&stream_base);
+        if (ok)
+            break;
         if (i == 0)
             fprintf(stderr, "waiting for SPS/PPS/IDR chain...");
         if (i >= 600) {

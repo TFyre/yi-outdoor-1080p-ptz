@@ -39,16 +39,17 @@ ByteStreamFifoSource::createNew(UsageEnvironment& env, char const* fileName,
     FILE* fid = OpenInputFile(env, fileName);
     if (fid == NULL) return NULL;
 
-    // Grow the fifo to 256 KB (kernel default 64 KB): big enough for a
-    // complete SPS+PPS+IDR chain (the join window the drain keeps),
-    // small enough that paced drain bursts stay far below the producer's
-    // lap threshold - the producer must re-sync on client stalls BEFORE
-    // the ring writer overwrites its position, which needs the normal
-    // block duration and the lap time to be clearly separated. Done
-    // here, with only this reader attached: F_SETPIPE_SZ fails with
-    // EEXIST once other handles are open (the producer's identical call
-    // on its write end fails for this reason and is ignored there).
-    (void)fcntl(fileno(fid), F_SETPIPE_SZ, 256 * 1024);
+    // Grow the fifo to 1 MB (kernel default 64 KB): a complete
+    // SPS+PPS+IDR chain must FIT WHOLE. At the IR-noise bitrate the
+    // chain is 300-500 KB - bigger than the old 256 KB fifo - so every
+    // chain write dribbled in as the client drained, blocking the
+    // producer's walk for ~0.5-1.5 s per GOP. The walk fell hundreds
+    // of KB behind the writer, MAX_LAG re-joins looped, and clients
+    // saw conceal storms. Done here, with only this reader attached:
+    // F_SETPIPE_SZ fails with EEXIST once other handles are open (the
+    // producer's own probe sets it first; its write-end call fails for
+    // this reason and is ignored there).
+    (void)fcntl(fileno(fid), F_SETPIPE_SZ, 1024 * 1024);
     if (debug & 4)
         fprintf(stderr, "fifo pipe size: %d\n",
                 (int)fcntl(fileno(fid), F_GETPIPE_SZ));
