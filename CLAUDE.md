@@ -107,9 +107,9 @@ never `read()` from the fifo (an early version ate the first 1024 bytes =
 the stream head). The server side (vendored
 `tools/vendor/ByteStreamFifoSource.{hh,cpp}`) drains the fifo at open
 keeping the tail from the last complete chain, waits up to ~3 s for a
-chain, and grows the fifo to 256 KB via F_SETPIPE_SZ on its own read end
-(the producer's write-end call fails with EEXIST once other handles are
-open).
+chain, and grows the fifo to 1 MB via F_SETPIPE_SZ on its own read end
+(the producer's pipe probe does the actual sizing before any writer
+opens; both set the same size).
 
 **The walk (commit 9382405, replaces all earlier pacing)**: the producer
 does NOT chase the frame counter (a ~45/s heartbeat, not a position) and
@@ -145,13 +145,61 @@ frame-counter delta across blocking fifo writes (the ring laps every ~4 s
 at ~440 KB/s; positional re-gates churn against that). Measured live:
 ~1 partial-frame decode error per 10–13 s (source-side), stable 15 fps
 1080p — was full-frame concealment on nearly every P frame. Forensics
-base: `analysis/s*.bin` snapshots, `tools/ringdiff.py`. Note the ring
-format has MODES: transient boot-time record streams (26/34-byte headers
-with `6a 8a 33 f?` magics) and the steady-state raw Annex-B mode above.
-The modes ALSO change mid-uptime: verified live that the c0 entries
-vanish while the encoder keeps running, and the header slots freeze when
-the writer reaches the buffer end — the ring-diff sampler in the
-producer tracks the writer through all of it.
+base: `analysis/s*.bin` snapshots, `tools/ringdiff.py`.
+
+**The record-framing (reverse-engineered from live snapshots 2026-08-24,
+commits f02fa63/c8437c4 — the producer's PRIMARY mode)**: the ring
+switches mid-uptime between the raw Annex-B mode above and a
+RECORD-framed mode whose every frame is a 24-byte header + a 4-byte-SC
+NAL (the magic's low byte is a writer sequence, not a class — classify
+by the TYPE):
+
+- header: `[0:2] u16 | [2:6] counter u32 (+1 per record, strictly
+  monotonic) | [6:10] magic u32 (mask 0xffff0000 == 0x6a8c0000) |
+  [10:14] u32 | [14:18] ts u32 | [18:20] type u16 | [20:22] sub u16`
+- types: **0x0400 hi-res frame / 0x0800 low-res frame / 0x0100 audio
+  (raw AAC, no SC, tail `00 00 ff f9`)** — the Allwinner flags — and
+  the chain parts **0x0422 SPS#1 (SC at +30, after an 8-byte prefix) /
+  0x0401 SPS#2 / 0x0404 PPS (SC at +24)** (0x08xx = the low-res chain)
+- the IDR is NOT record-framed: after the SPS#2 record's NAL it follows
+  RAW (PPS + ~20 zeros + IDR) until the next record — chains every
+  ~78 records
+- the record walk (drain_record_round) emits only 0x0400 + the 0x04xx
+  chain parts with EXACT boundaries (successor record = the slice end);
+  the successor's existence IS the completeness proof, and the
+  successor-less newest record IS the write head (walk-driven — no c0
+  slots, no diff sampler, no MAX_LAG false fires). The raw Annex-B/c0
+  mode remains the fallback when records go stale (5 s); the NAL walk
+  there trims the next record's 25-byte header from slice ends.
+- **The record counter is the only reliable clock**: the 0x18 frame
+  counter races (~45–300/s) and wraps BACKWARD mid-era; every
+  freshness/ordering check must use the record counter + wall clock.
+  The app RESETS the counter era mid-uptime (126K→10K and smaller
+  drops); rec_head_adopt re-anchors the walk on a >10k drop.
+- **The fifo must be 1 MB** (chains are 300–500 KB at IR-noise
+  bitrates; a 256 KB fifo wedged the chain writes in EAGAIN forever).
+  The producer's pipe probe must keep its read fd open until the write
+  end opens — otherwise the pipe inode dies with the probe's close and
+  the capacity reverts to 64 KB. `copy_nal` must handle a start-code
+  view at buf_size-1 (the chunked copy; the old two-memcpy version
+  computed a negative chunk length = one corrupt slice per lap).
+- Offline repro: copy a ring snapshot to `/dev/shm/fshare_frame_buf`
+  in WSL and run the x86 build (`gcc -O0 -g` of the same source) —
+  `-o out.h264` dumps the walk's exact emission for decode/diff.
+
+Note the ring format has MODES: transient boot-time record streams
+(26/34-byte headers with `6a 8a 33 f?` magics — an older record era)
+and the steady-state raw Annex-B mode above. The modes ALSO change
+mid-uptime: verified live that the c0 entries vanish while the encoder
+keeps running, and the header slots freeze when the writer reaches the
+buffer end — the ring-diff sampler in the producer tracks the writer
+through all of it (legacy; the record walk no longer needs it).
+
+**Known remaining issue**: ~1 decode error per ring lap in the
+hyperactive era (~1000 records/s; the app's most stressed state) —
+the offline x86 harness reproduces it; the sim's equivalent walk on
+the same snapshot decodes clean, so the divergence is a C-only subtlety
+not yet pinned.
 
 ## Backup
 
