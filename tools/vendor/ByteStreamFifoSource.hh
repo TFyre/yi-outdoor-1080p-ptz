@@ -88,12 +88,6 @@ private:
     unsigned char* fPendingData;
     unsigned fPendingLen;
     unsigned fPendingOff;
-
-    // Wall time of the last byte actually read from the fifo. A new
-    // session after a gap triggers skipStaleFifoContent() (see there).
-    struct timeval fLastReadTime;
-
-    void skipStaleFifoContent();
 };
 
 #endif

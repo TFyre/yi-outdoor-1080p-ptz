@@ -26,38 +26,8 @@ along with this library; if not, write to the Free Software Foundation, Inc.,
 #include <fcntl.h>
 #include <string.h>
 #include <unistd.h>
-#include <sys/ioctl.h>
 
 ////////// ByteStreamFifoSource //////////
-
-#define DRAIN_CAP (2048*1024)
-
-/* Scan for the last complete SPS->PPS->IDR chain (SEI/AUD allowed
- * inside) in 4-byte-start-code Annex-B data. Sets *keep to the chain's
- * start (or the last SPS). Returns 2 (complete chain), 1 (SPS only),
- * or 0 (nothing). Shared by createNew()'s drain and the session-gap
- * skip in skipStaleFifoContent(). */
-static int findLastChain(const unsigned char* data, unsigned total, unsigned* keep) {
-    int have_sps = 0;        /* 0 none, 1 SPS, 2 SPS+PPS */
-    unsigned chain_sps = 0;
-    int found = 0;
-    for (unsigned i = 0; i + 5 <= total; i++) {
-        if (data[i] != 0 || data[i+1] != 0 ||
-            data[i+2] != 0 || data[i+3] != 1)
-            continue;
-        unsigned t = data[i+4] & 0x1F;
-        switch (t) {
-        case 7: chain_sps = i; have_sps = 1; *keep = i; found = 1; break;
-        case 8: if (have_sps == 1) have_sps = 2; break;
-        case 5:
-            if (have_sps == 2) { *keep = chain_sps; found = 2; have_sps = 0; }
-            break;
-        case 6: case 9: break;
-        default: have_sps = 0; break;
-        }
-    }
-    return found;
-}
 
 extern int debug;
 
@@ -103,9 +73,11 @@ ByteStreamFifoSource::createNew(UsageEnvironment& env, char const* fileName,
     // fits in the drain window.
     ByteStreamFifoSource* newSource = NULL;
     {
+#define DRAIN_CAP (2048*1024)
         unsigned char* drained = new unsigned char[DRAIN_CAP];
         unsigned total = 0;
         unsigned keep = 0, found = 0;
+        unsigned chain_sps = 0;
         int attempt;
 
         /* Drain the fifo and keep the tail from the last complete
@@ -124,7 +96,22 @@ ByteStreamFifoSource::createNew(UsageEnvironment& env, char const* fileName,
              * producer emits 4-byte start codes (00 00 00 01); match those
              * so the kept tail begins with a full code — LIVE555's framer
              * only syncs on the 4-byte form. */
-            found = findLastChain(drained, total, &keep);
+            int have_sps = 0;        /* 0 none, 1 SPS, 2 SPS+PPS */
+            for (unsigned i = 0; i + 5 <= total; i++) {
+                if (drained[i] != 0 || drained[i+1] != 0 ||
+                    drained[i+2] != 0 || drained[i+3] != 1)
+                    continue;
+                unsigned t = drained[i+4] & 0x1F;
+                switch (t) {
+                case 7: chain_sps = i; have_sps = 1; keep = i; found = 1; break;
+                case 8: if (have_sps == 1) have_sps = 2; break;
+                case 5:
+                    if (have_sps == 2) { keep = chain_sps; found = 2; have_sps = 0; }
+                    break;
+                case 6: case 9: break;
+                default: have_sps = 0; break;
+                }
+            }
             if (found == 2) break;
             if (attempt < 15) {
                 /* no complete chain yet; give the producer a moment */
@@ -176,8 +163,6 @@ ByteStreamFifoSource::ByteStreamFifoSource(UsageEnvironment& env, FILE* fid,
       fPlayTimePerFrame(playTimePerFrame), fLastPlayTime(0),
       fHaveStartedReading(False), fLimitNumBytesToStream(False), fNumBytesToStream(0),
       fPendingData(NULL), fPendingLen(0), fPendingOff(0) {
-    fLastReadTime.tv_sec = 0;
-    fLastReadTime.tv_usec = 0;
 #ifndef READ_FROM_FILES_SYNCHRONOUSLY
     makeSocketNonBlocking(fileno(fFid));
 #endif
@@ -208,17 +193,6 @@ void ByteStreamFifoSource::doGetNextFrame() {
         // for fifo activity (the fifo may well be empty at this point).
         doReadFromFile();
         return;
-    }
-    // A session gap: the fifo holds the idle backlog (the purger caps
-    // it at ~224 KB). Skip it down to the freshest complete chain
-    // before delivering anything from it, so a joining client starts
-    // ~live instead of draining the backlog into its own queue (the
-    // observed ~4 s latency that never catches up).
-    if (fLastReadTime.tv_sec != 0 || fLastReadTime.tv_usec != 0) {
-        struct timeval now;
-        gettimeofday(&now, NULL);
-        if (now.tv_sec - fLastReadTime.tv_sec >= 2)
-            skipStaleFifoContent();
     }
     if (!fHaveStartedReading) {
         // Await readable data from the file:
@@ -269,41 +243,6 @@ void ByteStreamFifoSource::retryRead(ByteStreamFifoSource* source) {
         source->doReadFromFile();
 }
 
-/* Discard the fifo's idle backlog down to the freshest complete
- * SPS->PPS->IDR chain (fallback: last SPS), keeping that tail as the
- * pending data served on the next read. Called when a session starts
- * after a gap: without this, a joining client drains the whole backlog
- * into its own queue and plays it at 1x - it stays ~4 s behind (the
- * backlog never shrinks, because the client's read pace equals the
- * producer's write pace) and its queue-cap pauses flood the producer's
- * fifo (whole-slice drops under motion). */
-void ByteStreamFifoSource::skipStaleFifoContent() {
-    int avail = 0;
-    unsigned total = 0;
-    unsigned keep = 0;
-    unsigned char* drained;
-
-    if (ioctl(fileno(fFid), FIONREAD, &avail) != 0 || avail <= 0)
-        return;
-    if (avail > DRAIN_CAP)
-        avail = DRAIN_CAP;
-    drained = new unsigned char[avail];
-    while (total < (unsigned)avail) {
-        size_t n = fread(drained + total, 1, (unsigned)avail - total, fFid);
-        if (n == 0)
-            break;
-        total += (unsigned)n;
-    }
-    if (findLastChain(drained, total, &keep) >= 1 && total > keep) {
-        delete[] fPendingData;
-        fPendingData = new unsigned char[total - keep];
-        memcpy(fPendingData, drained + keep, total - keep);
-        fPendingLen = total - keep;
-        fPendingOff = 0;
-    }
-    delete[] drained;
-}
-
 void ByteStreamFifoSource::doReadFromFile() {
     // Serve the kept drain tail first (see createNew): it ends exactly
     // where the fifo's current content begins, so the stream stays
@@ -352,7 +291,6 @@ void ByteStreamFifoSource::doReadFromFile() {
                 return;
             }
             fFrameSize = (unsigned)n;
-            gettimeofday(&fLastReadTime, NULL);   /* session-gap clock */
         }
 #endif
     }
