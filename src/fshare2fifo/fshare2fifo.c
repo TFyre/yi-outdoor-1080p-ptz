@@ -542,10 +542,17 @@ static uint32_t head_live_fctr;        /* frame counter at the last advance */
 /* The ring-diff sampler's writer position (diff_thread below):
  * authoritative in every mode once the sampler has produced it. */
 #define DATA_BASE 0x100               /* below this is header/slots only */
-static uint8_t *shadow;               /* last sampled copy of the ring */
-static uint8_t *shadow2;              /* tear-check twin: a second read of
-                                       * the live ring; identical copies
-                                       * prove neither was torn by a lap */
+static uint8_t *shadow;               /* last sampled copy of the diff
+                                       * window (DIFF_WIN bytes, indexed
+                                       * relative to the window's start) */
+#define TEAR_CHUNK (64u * 1024)       /* tear-check twin is a small temp:
+                                       * a full second shadow (1.79 MB)
+                                       * tipped the camera's tight RAM
+                                       * over the OOM killer's edge (the
+                                       * producer died SIGKILLed during
+                                       * the app's write bursts). Copies
+                                       * are checked in 64 KB chunks. */
+static uint8_t *shadow2;              /* tear-check twin (TEAR_CHUNK) */
 static volatile uint32_t diff_head;   /* newest write position seen */
 
 static uint32_t update_head(void)
@@ -646,18 +653,29 @@ static uint32_t update_head(void)
  * (0.25 s at the peak bitrate). Only the header (below 0x100) is
  * excluded: the ring's data base itself varies by mode/era (measured
  * below 0x224b0), so everything above the header must be scanned. */
-#define DIFF_WIN (512u * 1024)       /* > max bytes per sample at peak rate */
+#define DIFF_WIN (256u * 1024)       /* the moving window's size: > max bytes
+                                       * per sample at the peak rate (a
+                                       * measured burst wrote 106 KB in one
+                                       * 250 ms tick) with a 2.4x margin.
+                                       * The shadow holds ONLY this window,
+                                       * addressed relative to its start -
+                                       * a full-ring shadow (1.79 MB) made
+                                       * the producer a sitting duck for the
+                                       * camera's OOM killer (35 MB RAM;
+                                       * SIGKILLed live during the app's
+                                       * bursts). */
 
 static void *diff_thread(void *arg)
 {
-    int first = 1;
     uint32_t base = DATA_BASE;
     (void)arg;
 
     usleep(250 * 1000);
     while (1) {
         uint32_t q = base;
-        size_t left = first ? buf_size : DIFF_WIN;
+        size_t left = DIFF_WIN;
+        size_t sdx = 0;          /* the shadow's linear index within the
+                                  * window (shadow[sdx] == ring[q]) */
         uint32_t run1 = 0;
         unsigned changed = 0;
         int run = 0;
@@ -667,13 +685,24 @@ static void *diff_thread(void *arg)
             size_t n;
             if (q >= buf_size)
                 q = 0;
-            if (q < DATA_BASE)
-                q = DATA_BASE;
             n = buf_size - q;
             if (n > left)
                 n = left;
+            if (q < DATA_BASE) {
+                /* below the header: the header is never scanned (its
+                 * counters churn), but the shadow's index must stay
+                 * aligned with the ring - advance both and leave the
+                 * shadow stale there (never compared). */
+                size_t skip = DATA_BASE - q;
+                if (skip > n)
+                    skip = n;
+                q += (uint32_t)skip;
+                sdx += skip;
+                left -= skip;
+                continue;
+            }
             for (i = 0; i < n; i++) {
-                if (buf[q + i] != shadow[q + i]) {
+                if (buf[q + i] != shadow[sdx + i]) {
                     /* run1 = the LAST changed byte in scan order: the
                      * writer writes contiguously in time, so this is
                      * its newest position even when coincidentally
@@ -705,13 +734,32 @@ static void *diff_thread(void *arg)
             {
                 int tries;
                 for (tries = 0; tries < 3; tries++) {
-                    memcpy(shadow + q, (const void *)(buf + q), n);
-                    memcpy(shadow2 + q, (const void *)(buf + q), n);
-                    if (!memcmp(shadow + q, shadow2 + q, n))
+                    size_t off = 0;
+                    int clean = 1;
+                    for (off = 0; off + TEAR_CHUNK <= n; off += TEAR_CHUNK) {
+                        memcpy(shadow + sdx + off, (const void *)(buf + q + off),
+                               TEAR_CHUNK);
+                        memcpy(shadow2, (const void *)(buf + q + off),
+                               TEAR_CHUNK);
+                        if (memcmp(shadow + sdx + off, shadow2, TEAR_CHUNK)) {
+                            clean = 0;
+                            break;
+                        }
+                    }
+                    if (clean && off < n) {
+                        memcpy(shadow + sdx + off, (const void *)(buf + q + off),
+                               n - off);
+                        memcpy(shadow2, (const void *)(buf + q + off),
+                               n - off);
+                        if (memcmp(shadow + sdx + off, shadow2, n - off))
+                            clean = 0;
+                    }
+                    if (clean)
                         break;
                 }
             }
             q += (uint32_t)n;
+            sdx += n;
             left -= n;
         }
         if (run) {
@@ -722,7 +770,6 @@ static void *diff_thread(void *arg)
             base = (run1 + 1 >= buf_size) ? DATA_BASE : run1 + 1;
             diff_head = base;
         }
-        first = 0;
         usleep(250 * 1000);
     }
     return NULL;
@@ -1818,21 +1865,41 @@ int main(int argc, char **argv)
 
     /* Writer-position sampler: its shadow starts as a copy of the ring
      * now, so the first diff sees everything written since startup. */
-    shadow = malloc(buf_size);
-    shadow2 = malloc(buf_size);   /* tear-check twin (see diff_thread) */
+    shadow = malloc(DIFF_WIN);    /* the moving window only (see DIFF_WIN) */
+    shadow2 = malloc(TEAR_CHUNK);   /* tear-check twin (64 KB chunks) */
     if (shadow && shadow2) {
         pthread_t diff_tid;
         int tries;
+        /* Seed the shadow with the first window [DATA_BASE, +DIFF_WIN);
+         * the diff thread starts from the same base. The window follows
+         * the writer from there - the writer enters it within one lap. */
         for (tries = 0; tries < 5; tries++) {
-            memcpy(shadow, (const void *)buf, buf_size);
-            memcpy(shadow2, (const void *)buf, buf_size);
-            if (!memcmp(shadow, shadow2, buf_size))
-                break;   /* two identical reads of a live ring are clean */
+            size_t off = 0;
+            int clean = 1;
+            for (off = 0; off + TEAR_CHUNK <= DIFF_WIN; off += TEAR_CHUNK) {
+                memcpy(shadow + off, (const void *)(buf + DATA_BASE + off),
+                       TEAR_CHUNK);
+                memcpy(shadow2, (const void *)(buf + DATA_BASE + off),
+                       TEAR_CHUNK);
+                if (memcmp(shadow + off, shadow2, TEAR_CHUNK)) {
+                    clean = 0;
+                    break;
+                }
+            }
+            if (clean && off < DIFF_WIN) {
+                memcpy(shadow + off, (const void *)(buf + DATA_BASE + off),
+                       DIFF_WIN - off);
+                memcpy(shadow2, (const void *)(buf + DATA_BASE + off),
+                       DIFF_WIN - off);
+                if (memcmp(shadow + off, shadow2, DIFF_WIN - off))
+                    clean = 0;
+            }
+            if (clean)
+                break;   /* identical reads of the live ring are clean */
         }
-        /* Never clean (the writer never paused): keep the last copy. The
-         * first diff's full-ring scan refreshes the shadow as it goes,
-         * and emit_nal's tear check catches any corrupted emission that
-         * a torn startup shadow could otherwise let through. */
+        /* Never clean (the writer never paused): keep the last copy -
+         * emit_nal's tear check catches any corrupted emission a torn
+         * startup shadow could otherwise let through. */
         pthread_create(&diff_tid, NULL, diff_thread, NULL);
     }
 
