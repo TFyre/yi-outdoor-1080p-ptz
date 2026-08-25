@@ -104,6 +104,9 @@
  * re-join at the newest chain and JUMP to the gate line instead of
  * dragging minutes of doomed content. */
 #define MAX_LAG (768u * 1024)
+#define HOPELESS_DIST (256u * 1024)  /* behind the head by more than this
+                                       * the slice backlog is unclosable:
+                                       * keyframes-only degradation */
 /* Backward moves of the head signal below this are round-robin jitter
  * (a few KB), not a ring wrap (~1.7 MB); clamp them in update_head. */
 #define JITTER_MAX (64u * 1024)
@@ -1755,10 +1758,20 @@ static int drain_round(size_t *pos, uint32_t head, int force)
                  * and the live OSD-timestamp rewind). Wait instead;
                  * the writer passes the position and the gate opens
                  * normally. */
-                if (s >= head)
+                if (s >= head) {
+                    if (f2f_trace())
+                        fprintf(stderr,
+                                "gate: s=0x%zx >= head=0x%x (wait)\n",
+                                s, head);
                     return 0;
-                if (dist_to_head_cached(s, head) < len + 3 + NAL_FLOOR)
+                }
+                if (dist_to_head_cached(s, head) < len + 3 + NAL_FLOOR) {
+                    if (f2f_trace())
+                        fprintf(stderr,
+                                "gate: dist=%zu < len=%zu+131 (wait)\n",
+                                dist_to_head_cached(s, head), len);
                     return 0;         /* may be in flight: wait */
+                }
             } else if (frame_counter() == hb) {
                 /* no writer position signal (record-mode ring): fall
                  * back to the heartbeat stop */
@@ -1788,6 +1801,22 @@ static int drain_round(size_t *pos, uint32_t head, int force)
             }
         }
         if (want_nal(s, e)) {
+            if (!force && head != 0 &&
+                dist_to_head_cached(s, head) > HOPELESS_DIST) {
+                /* The writer outruns the emission (the hyperactive eras
+                 * write up to ~1 MB/s - the ring laps every ~2 s, the
+                 * walk emits ~50 KB/s). The slice backlog can never be
+                 * closed by emitting it; skip the mid-GOP slices and
+                 * emit only the chains (decodable keyframes). The walk
+                 * then catches the head cheaply, the full emission
+                 * resumes, and the client sees a ~1 fps keyframe slide
+                 * instead of a frozen picture and a re-join storm. */
+                t = buf[s + 3] & 0x1F;
+                if (t != 7 && t != 8 && t != 5) {
+                    *pos = e;
+                    continue;
+                }
+            }
             int r = emit_nal(s, e);
             if (r == -1) {
                 /* Fifo full: DROP the NAL and keep walking. Blocking
