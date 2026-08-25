@@ -130,6 +130,9 @@ static int have_sps;
  * 2 = the chain's IDR is out: drain_forever jumps the walk to the gate
  * line, dropping the un-closable mid-GOP backlog. */
 static int just_joined;
+static size_t last_join_pos;        /* chain start of the last join emitted;
+                                     * a re-join at the same position must
+                                     * not replay it (see rejoin_at) */
 /* Slice discriminator: the ring carries two interleaved streams whose
  * slices share the same 9a 00 header shape. The app's own frame table
  * (the 00 00 01 c0 entries, one per consumed frame) carries a TYPE
@@ -271,6 +274,12 @@ static unsigned sps_read_ue(const uint8_t *s, size_t slen, size_t *pos)
     return z > 24 ? 0xFFFFU : ((1u << z) - 1 + v);
 }
 
+static int sps_read_se(const uint8_t *s, size_t slen, size_t *pos)
+{
+    unsigned k = sps_read_ue(s, slen, pos);
+    return (int)((k & 1) ? (k + 1) / 2 : -(int)(k / 2));
+}
+
 #define SPS_UE(label, var) \
     do { (var) = sps_read_ue(stripped, slen, &pos); \
          if (f2f_trace()) fprintf(stderr, "  %s = %u (pos %zu)\n", \
@@ -349,6 +358,112 @@ static int parse_sps_dims(const uint8_t *d, size_t len, unsigned *w, unsigned *h
     if (sps_read_bit(stripped, slen, &pos) == 0)  /* frame_mbs_only_flag */
         *h *= 2;
     return 1;
+}
+
+/* The PPS's true length: the NAL-era chain region glues the app's
+ * metadata after the PPS's rbsp_stop, and the decoder reads that junk
+ * as PPS syntax and dies ("Invalid data found when processing input"
+ * - reproduced offline; the junk inside the SPS is tolerated, the PPS
+ * is not). The PPS's grammar is short: ue, ue, two flags, ue (the
+ * slice-group count, 0 for this camera), then the stop bit. Returns
+ * the body length, or 0 if the parse fails or the slice-group map is
+ * present (callers then keep the untrimmed emission). */
+static size_t parse_pps_len(const uint8_t *d, size_t len)
+{
+    uint8_t stripped[NAL_BUF_MAX];
+    size_t slen = 0;
+    size_t i, pos;
+    unsigned v;
+
+    if (len < 2 || len > NAL_BUF_MAX)
+        return 0;
+    for (i = 0; i < len && slen < sizeof(stripped); i++) {
+        if (slen >= 2 && stripped[slen - 1] == 0 && stripped[slen - 2] == 0 &&
+            d[i] == 3)
+            continue;
+        stripped[slen++] = d[i];
+    }
+    if (slen < 2)
+        return 0;
+
+    pos = 8;                       /* skip the NAL header byte */
+    SPS_UE("pps: pic_parameter_set_id", v);
+    SPS_UE("pps: seq_parameter_set_id", v);
+    (void)sps_read_bit(stripped, slen, &pos); /* entropy_coding_mode_flag */
+    (void)sps_read_bit(stripped, slen, &pos); /* bottom_field_pic_order_in_frame_present */
+    SPS_UE("pps: num_slice_groups_minus1", v);
+    if (v > 0)
+        return 0;                  /* slice-group map present: bail */
+    SPS_UE("pps: num_ref_idx_l0_default_active_minus1", v);
+    SPS_UE("pps: num_ref_idx_l1_default_active_minus1", v);
+    (void)sps_read_bit(stripped, slen, &pos); /* weighted_pred_flag */
+    (void)sps_read_bit(stripped, slen, &pos); /* weighted_bipred_idc bit 1 */
+    (void)sps_read_bit(stripped, slen, &pos); /* weighted_bipred_idc bit 2 */
+    (void)sps_read_se(stripped, slen, &pos);  /* pic_init_qp_minus26 */
+    (void)sps_read_se(stripped, slen, &pos);  /* pic_init_qs_minus26 */
+    (void)sps_read_se(stripped, slen, &pos);  /* chroma_qp_index_offset */
+    (void)sps_read_bit(stripped, slen, &pos); /* deblocking_filter_control_present */
+    (void)sps_read_bit(stripped, slen, &pos); /* constrained_intra_pred_flag */
+    (void)sps_read_bit(stripped, slen, &pos); /* redundant_pic_cnt_present_flag */
+    /* The 8x8/scaling extension follows only when more_rbsp_data() is
+     * set: the next 1 bit is the stop if everything after it is zero.
+     * Reading the extension unconditionally mistook the stop for the
+     * transform_8x8 flag here (the PPS ends '80' = stop + padding). */
+    {
+        size_t probe = pos;
+        int one = -1;
+        while (probe < slen * 8) {
+            if (sps_read_bit(stripped, slen, &probe) == 1) {
+                one = (int)probe - 1;
+                break;
+            }
+        }
+        if (one >= 0) {
+            /* The trailing bits pad only to the END OF THE STOP'S BYTE;
+             * bytes beyond it are the app's glued metadata, not RBSP -
+             * scanning them made the junk look like the extension. */
+            size_t after = (size_t)one + 1;
+            size_t byte_end = ((size_t)one / 8 + 1) * 8;
+            int all_zero = 1;
+            while (after < byte_end && after < slen * 8) {
+                if (sps_read_bit(stripped, slen, &after) != 0) {
+                    all_zero = 0;
+                    break;
+                }
+            }
+            if (!all_zero) {
+                /* the extension is present: walk it */
+                unsigned m;
+                if (sps_read_bit(stripped, slen, &pos)) { /* pic_scaling_matrix_present */
+                    unsigned n = (6 + ((stripped[1] == 100 || stripped[1] == 110 ||
+                                        stripped[1] == 122 || stripped[1] == 244 ||
+                                        stripped[1] == 44 || stripped[1] == 83 ||
+                                        stripped[1] == 86 || stripped[1] == 118 ||
+                                        stripped[1] == 128 || stripped[1] == 138 ||
+                                        stripped[1] == 139 || stripped[1] == 134 ||
+                                        stripped[1] == 135) ? 2 : 0)) * 16;
+                    for (m = 0; m < n; m++) {
+                        if (sps_read_bit(stripped, slen, &pos)) {
+                            unsigned j, last = 8, nxt = 8;
+                            for (j = 0; j < 16; j++) {
+                                if (nxt != 0)
+                                    nxt = (last + sps_read_ue(stripped, slen, &pos)) % 256;
+                                last = nxt != 0 ? nxt : last;
+                            }
+                        }
+                    }
+                }
+                (void)sps_read_se(stripped, slen, &pos); /* second_chroma_qp_index_offset */
+                if (sps_read_bit(stripped, slen, &pos) != 1)
+                    return 0;
+                return (pos + 7) / 8 - 1;
+            }
+            /* the stop at 'one' */
+            pos = (size_t)one + 1;
+            return (pos + 7) / 8 - 1;
+        }
+    }
+    return 0;
 }
 
 /* Copy the NAL body (bytes after the 3-byte start code) from ring
@@ -1641,6 +1756,25 @@ static int drain_round(size_t *pos, uint32_t head, int force)
             }
         }
         t = buf[s + 3] & 0x1F;
+        if (t == 8) {
+            /* Trim the PPS to its true body: the NAL-era chain glues
+             * the app's metadata after the rbsp_stop, and the decoder
+             * parses that junk as PPS syntax and dies (reproduced
+             * offline: "Invalid data found when processing input"). */
+            size_t plen = (e > s) ? (e - s - 3) : (buf_size - s - 3 + e);
+            size_t true_len;
+            uint8_t pb[64];
+            if (plen > sizeof(pb))
+                plen = sizeof(pb);
+            copy_nal_head(s, pb, plen);
+            true_len = parse_pps_len(pb, plen);
+            if (true_len > 0 && true_len < plen) {
+                size_t ne = s + 3 + true_len;
+                if (ne >= buf_size)
+                    ne -= buf_size;
+                e = ne;
+            }
+        }
         if (want_nal(s, e)) {
             int r = emit_nal(s, e);
             if (r == -1) {
@@ -1665,12 +1799,40 @@ static int drain_round(size_t *pos, uint32_t head, int force)
     return 0;
 }
 
+/* Re-join guard: a re-join that finds the SAME chain the last join
+ * emitted (the writer is mid-GOP and no newer chain exists yet) must
+ * NOT re-emit it - that replays a GOP of already-served content and
+ * the burned-in OSD clock visibly jumps BACKWARD (the reported
+ * symptom: the player's timestamp rewinds every so often). Jump to
+ * the gate line instead and resume mid-GOP; the decoder conceals the
+ * skipped frames and re-locks at the next real chain. */
+static void rejoin_at(size_t *pos, size_t chain_pos, uint32_t head)
+{
+    if (chain_pos == last_join_pos) {
+        size_t j = head >= NAL_FLOOR ? head - NAL_FLOOR
+                                     : buf_size + head - NAL_FLOOR;
+        if (j > buf_size - 4)
+            j = buf_size - 4;
+        *pos = j;
+        just_joined = 0;
+        if (f2f_trace())
+            fprintf(stderr,
+                    "re-join: same chain 0x%zX - jumping mid-GOP\n",
+                    chain_pos);
+    } else {
+        last_join_pos = chain_pos;
+        usleep(1000 * 1000);
+        just_joined = 1;
+    }
+}
+
 static void drain_forever(void)
 {
     size_t pos = stream_base;
     time_t next_log = 0;
     int head_was_dead = 0;
     int rec_mode = 0;
+    last_join_pos = stream_base;
     just_joined = 1;
 
     while (1) {
@@ -1698,9 +1860,8 @@ static void drain_forever(void)
              * newest chain. */
             rec_head_reset = 0;
             if (rec_find_chain_start(&pos)) {
-                usleep(1000 * 1000);
-                just_joined = 1;
                 fprintf(stderr, "era-reset: chain at 0x%zX\n", pos);
+                rejoin_at(&pos, pos, head);
             }
         }
 
@@ -1710,9 +1871,8 @@ static void drain_forever(void)
             /* The ring switched into record framing: re-anchor at the
              * newest complete chain before walking it. */
             if (rec_find_chain_start(&pos)) {
-                usleep(1000 * 1000);
-                just_joined = 1;
                 fprintf(stderr, "mode->record: chain at 0x%zX\n", pos);
+                rejoin_at(&pos, pos, head);
             }
         }
         rec_mode = rec_now;
@@ -1751,9 +1911,8 @@ static void drain_forever(void)
             /* Record counter desync: a false successor or the writer
              * lapped the walk - re-join at the newest chain. */
             if (rec_find_chain_start(&pos)) {
-                usleep(1000 * 1000);
-                just_joined = 1;
                 fprintf(stderr, "re-join: record chain at 0x%zX\n", pos);
+                rejoin_at(&pos, pos, head);
             } else {
                 usleep(200 * 1000);
             }
@@ -1774,9 +1933,8 @@ static void drain_forever(void)
             head_was_dead = 0;
             if ((rec_mode && rec_find_chain_start(&pos)) ||
                 (!rec_mode && find_idr_start(&pos))) {
-                usleep(1000 * 1000);
-                just_joined = 1;
                 fprintf(stderr, "re-join: IDR start at 0x%zX\n", pos);
+                rejoin_at(&pos, pos, head);
             } else {
                 usleep(200 * 1000);
             }
@@ -1793,9 +1951,8 @@ static void drain_forever(void)
                         pos, head, dist_to_head_cached(pos, head));
             if ((rec_mode && rec_find_chain_start(&pos)) ||
                 (!rec_mode && find_idr_start(&pos))) {
-                usleep(1000 * 1000);
-                just_joined = 1;
                 fprintf(stderr, "re-join: IDR start at 0x%zX\n", pos);
+                rejoin_at(&pos, pos, head);
             } else {
                 usleep(200 * 1000);
             }
