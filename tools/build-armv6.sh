@@ -55,6 +55,20 @@ build_slotprobe() {
     ls -la slotprobe
 }
 
+build_endprobe() {
+    cd "$REPO/src/ring-capture"
+    ${CROSS}-gcc $FLAGS -Wall -o endprobe endprobe.c -lpthread
+    verify_armv6 endprobe
+    ls -la endprobe
+}
+
+build_scanprobe() {
+    cd "$REPO/src/ring-capture"
+    ${CROSS}-gcc $FLAGS -Wall -o scanprobe scanprobe.c -lpthread
+    verify_armv6 scanprobe
+    ls -la scanprobe
+}
+
 build_rtspserver() {
     SRC=$REPO/analysis/upstream-yi-hack-v5/src/rRTSPServer
     LIVE=$SRC/live
@@ -128,6 +142,8 @@ case "$TARGET" in
     rtspserver)  build_rtspserver ;;
     ringcapture) build_ringcapture ;;
     slotprobe)   build_slotprobe ;;
-    all)         build_fshare2fifo; build_ringcapture; build_slotprobe; build_rtspserver ;;
+    endprobe)    build_endprobe ;;
+    scanprobe)   build_scanprobe ;;
+    all)         build_fshare2fifo; build_ringcapture; build_slotprobe; build_endprobe; build_scanprobe; build_rtspserver ;;
     *) echo "usage: $0 <fshare2fifo|ringcapture|rtspserver|all>"; exit 1 ;;
 esac
