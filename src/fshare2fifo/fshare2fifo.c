@@ -136,6 +136,9 @@ static int just_joined;
 static size_t last_join_pos;        /* chain start of the last join emitted;
                                      * a re-join at the same position must
                                      * not replay it (see rejoin_at) */
+static size_t max_emitted;          /* furthest ring position emitted (both
+                                     * drains update it); re-joins must never
+                                     * land behind it */
 /* Slice discriminator: the ring carries two interleaved streams whose
  * slices share the same 9a 00 header shape. The app's own frame table
  * (the 00 00 01 c0 entries, one per consumed frame) carries a TYPE
@@ -1319,6 +1322,8 @@ static int drain_record_round(size_t *pos, int force)
                 *pos = q;
                 continue;
             }
+            if (q > max_emitted)
+                max_emitted = q;
             r = emit_nal(sc1, q);
             if (r == -1)
                 g_drops++;           /* full fifo: drop whole, keep walking */
@@ -1403,6 +1408,8 @@ static int drain_record_round(size_t *pos, int force)
             break;
         }
         *pos = q;
+        if (q > max_emitted)
+            max_emitted = q;
     }
     return 0;
 }
@@ -1615,9 +1622,15 @@ static int find_idr_start(size_t *out)
     int pass;
     /* The record-mode head is authoritative when records are fresh (the
      * c0/slot signals are dead there - verified live: the slots froze at
-     * the buffer end while the writer moved on). */
+     * the buffer end while the writer moved on). The diff sampler's head
+     * wins whenever it has one: the c0/slot scan goes STALE in the NAL
+     * eras, and a re-join anchored to a stale head picked a chain BEHIND
+     * the content already emitted - the offline file showed the OSD jump
+     * 15:45:28 -> 15:45:19 (the reported "timestamp jumps back"). */
     uint32_t head = record_head();
-    if (head == 0 || !record_head_fresh())
+    if ((head == 0 || !record_head_fresh()) && diff_head != 0)
+        head = diff_head;
+    if (head == 0)
         head = head_estimate(NULL);  /* once per call: the scan is costly */
 
     for (pass = 0; pass < 2; pass++) {
@@ -1836,20 +1849,36 @@ static int drain_round(size_t *pos, uint32_t head, int force)
             }
         }
         *pos = e;
+        if (e > max_emitted)
+            max_emitted = e;
     }
     return 0;
 }
 
-/* Re-join guard: a re-join that finds the SAME chain the last join
- * emitted (the writer is mid-GOP and no newer chain exists yet) must
- * NOT re-emit it - that replays a GOP of already-served content and
- * the burned-in OSD clock visibly jumps BACKWARD (the reported
- * symptom: the player's timestamp rewinds every so often). Jump to
- * the gate line instead and resume mid-GOP; the decoder conceals the
- * skipped frames and re-locks at the next real chain. */
+/* Re-join guard: a re-join must never emit a chain BEHIND what the
+ * walk has already served - not just the same chain as the last join.
+ * The "newest complete chain" search has landed 4-10 s back in the
+ * content (measured with the OSD OCR: BACKWARD jumps at every re-join
+ * in the offline harness), replaying old video and rewinding the
+ * burned-in clock. Jump to the gate line instead and resume mid-GOP;
+ * the decoder conceals the skipped frames and re-locks at the next
+ * real chain. */
+/* Is chain_pos behind the walk's furthest emission? Raw positions
+ * with the wrap: a small backward gap means behind; a large one is
+ * the wrap-around forward case. */
+static int chain_behind(size_t chain_pos)
+{
+    if (max_emitted == 0)
+        return 0;
+    if (chain_pos <= max_emitted &&
+        max_emitted - chain_pos < buf_size / 2)
+        return 1;
+    return 0;
+}
+
 static void rejoin_at(size_t *pos, size_t chain_pos, uint32_t head)
 {
-    if (chain_pos == last_join_pos) {
+    if (chain_pos == last_join_pos || chain_behind(chain_pos)) {
         size_t j = head >= NAL_FLOOR ? head - NAL_FLOOR
                                      : buf_size + head - NAL_FLOOR;
         if (j > buf_size - 4)
