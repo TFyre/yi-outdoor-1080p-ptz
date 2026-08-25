@@ -134,21 +134,38 @@ sprint). Per-second diagnostics:
 `F2F_AGELOG=1` logs pos/head/dist/emission/block stats.
 
 **The slot protocol (the ring's real contract, discovered 2026-08-25,
-commit 57e4e2d)**: the app coordinates `fshare_frame_buf` with named
-POSIX semaphores in /dev/shm: `sem.fshare_write_lock` +
-`sem.fshare_read_lock` (both value 1) and 17 per-slot notifies
-`sem.fshare_read_notify_0..16` (all value 0). The app's own consumers
-(tserver, mp4record) register as readers, hold a slot, and wait on its
-notify; the ring header holds two reader cursors (0x0C/0x10, ~2 KB
-apart, moving together) plus the frame counter (0x18) and a second
-counter (0x24). fshare2fifo uses NONE of it — a blind diff-walk reader.
-The semprobe (src/ring-capture/semprobe.c) saw zero posts on all 17
-slots in 2 s each: posts are targeted at registered/lagging readers,
-not broadcast, so a reader must register to get data. The reader-side
-protocol is being reverse-engineered from the tserver disassembly into
-`analysis/fshare-protocol.md`; the goal is fshare2fifo v2: register,
-wait on the notify, read exactly the signaled frame (see also
-`src/ring-capture/slotprobe.c`, the live read-only mapper).
+commit 57e4e2d, refined by the slotprobe/endprobe/scanprobe/cap-timeline
+live maps)**: the app coordinates `fshare_frame_buf` with named POSIX
+semaphores in /dev/shm: `sem.fshare_write_lock` + `sem.fshare_read_lock`
+(both value 1) and 17 per-slot notifies `sem.fshare_read_notify_0..16`.
+Measured live (all values raw-read from the backing files):
+- 0x0C = a full-ring cursor advancing per WRITE CHUNK (~28/s in the
+  current era; the dominant step is 196-197 B at 7.1/s = record-framed
+  audio: 24-byte header + ~172-byte AAC) and LEADING the actual byte
+  writes by ~6-11 KB (a reservation frontier; the diff-based write
+  head lags it — reading to 0x0C emits stale pre-lap bytes).
+- 0x04 advances in EXACT lockstep with 0x0C (every delta matches,
+  audio-paced), confined to a 215 KB band at the file top
+  [1.57M, 1.786M], with a piecewise-constant offset 04-0c that changes
+  every ~2-3 s. Role unconfirmed (raw-frame ring? mirror?).
+- 0x10 freezes for seconds then leaps (a slow consumer cursor).
+- The notify words are futex wait-queue markers: slot 0 = -1, slot 1 =
+  0xFDEA64D4, slot 2 = 0xFFF569EA (kernel wait-queue addresses) —
+  the app's readers (tserver? mp4record?) are PARKED on slots 1-2;
+  posts are consumed in microseconds, which is why every probe sees
+  zero. Not broadcast per chunk; the trigger is unknown.
+- The current era is raw Annex-B mode: zero valid c0 checkpoints and
+  zero record markers in a full-ring scan; the 0x0C advances are NOT
+  record- or frame-aligned (0/828 regions started on a record header),
+  which REJECTED the "emit [E_prev, E_new) regions" v2 design.
+fshare2fifo uses none of the protocol — a blind diff-walk reader whose
+diff head is nonetheless the correct byte boundary. The reader-side
+protocol is being reverse-engineered from the tserver disassembly
+into `analysis/fshare-protocol.md`; the open questions for it: what
+is 0x04, what triggers a notify post, and what the 0xffffffff /
+wait-queue futex words encode. Probes:
+`src/ring-capture/{semprobe,slotprobe,endprobe,scanprobe,cap-timeline}.c`;
+artifacts: `analysis/timeline-20260825.txt` + `ring-cap-20260825.bin`.
 
 **Ring format (reverse-engineered from live captures, commit 1677010)**:
 the ring carries TWO interleaved H.264 streams — the target 1920×1088
