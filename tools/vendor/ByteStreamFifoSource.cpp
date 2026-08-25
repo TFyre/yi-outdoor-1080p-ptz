@@ -25,7 +25,9 @@ along with this library; if not, write to the Free Software Foundation, Inc.,
 
 #include <fcntl.h>
 #include <string.h>
+#include <stdlib.h>
 #include <unistd.h>
+#include <sys/ioctl.h>
 
 ////////// ByteStreamFifoSource //////////
 
@@ -163,7 +165,13 @@ ByteStreamFifoSource::ByteStreamFifoSource(UsageEnvironment& env, FILE* fid,
     : FramedFileSource(env, fid), fFileSize(0), fPreferredFrameSize(preferredFrameSize),
       fPlayTimePerFrame(playTimePerFrame), fLastPlayTime(0),
       fHaveStartedReading(False), fLimitNumBytesToStream(False), fNumBytesToStream(0),
-      fPendingData(NULL), fPendingLen(0), fPendingOff(0) {
+      fPendingData(NULL), fPendingLen(0), fPendingOff(0), fTee(NULL) {
+    const char* teePath = getenv("F2F_TEE");
+    if (teePath != NULL && teePath[0] != '\0') {
+        fTee = fopen(teePath, "wb");
+        if (fTee != NULL)
+            setvbuf(fTee, NULL, _IONBF, 0);   /* byte-for-byte, no lost tail */
+    }
 #ifndef READ_FROM_FILES_SYNCHRONOUSLY
     makeSocketNonBlocking(fileno(fFid));
 #endif
@@ -171,6 +179,7 @@ ByteStreamFifoSource::ByteStreamFifoSource(UsageEnvironment& env, FILE* fid,
 
 ByteStreamFifoSource::~ByteStreamFifoSource() {
     delete[] fPendingData;
+    if (fTee != NULL) fclose(fTee);
     if (fFid == NULL) return;
 
 #ifndef READ_FROM_FILES_SYNCHRONOUSLY
@@ -211,6 +220,7 @@ void ByteStreamFifoSource::doGetNextFrame() {
     if (nextTask() == NULL) {
         nextTask() = envir().taskScheduler().scheduleDelayedTask(
             200000, (TaskFunc*)&retryRead, this);
+        if (debug & 4) fprintf(stderr, "src: getnext armed hb\n");
     }
 #endif
 }
@@ -242,6 +252,8 @@ void ByteStreamFifoSource::retryRead(ByteStreamFifoSource* source) {
     source->nextTask() = NULL;
     if (source->isCurrentlyAwaitingData())
         source->doReadFromFile();
+    else if (debug & 4)
+        fprintf(stderr, "src: retry fired, not awaiting\n");
 }
 
 void ByteStreamFifoSource::doReadFromFile() {
@@ -275,6 +287,12 @@ void ByteStreamFifoSource::doReadFromFile() {
              * unsigned frame size (which made the H264 parser read 4GB
              * and segfault). */
             ssize_t n = read(fileno(fFid), fTo, fMaxSize);
+            if (debug & 4) {
+                int fill = 0;
+                ioctl(fileno(fFid), FIONREAD, &fill);
+                fprintf(stderr, "src: read n=%d fill=%d awaiting=%d\n",
+                        (int)n, fill, isCurrentlyAwaitingData());
+            }
             if (n == 0) {
                 handleClosure();
                 return;
@@ -295,6 +313,7 @@ void ByteStreamFifoSource::doReadFromFile() {
         }
 #endif
     }
+    if (fTee != NULL) fwrite(fTo, 1, fFrameSize, fTee);
     fNumBytesToStream -= fFrameSize;
 
     // Set the 'presentation time':
@@ -323,7 +342,9 @@ void ByteStreamFifoSource::doReadFromFile() {
         gettimeofday(&fPresentationTime, NULL);
         fDurationInMicroseconds = fPlayTimePerFrame;
     }
-    if (debug & 4) fprintf(stderr, "h264 frame - fPresentationTime, sec = %ld, usec = %ld\n", fPresentationTime.tv_sec, fPresentationTime.tv_usec);
+    if (debug & 4) fprintf(stderr, "h264 frame - fPresentationTime, sec = %lld, usec = %lld\n",
+                           (long long)fPresentationTime.tv_sec,
+                           (long long)fPresentationTime.tv_usec);
 
     // Inform the reader that he has data:
 #ifdef READ_FROM_FILES_SYNCHRONOUSLY

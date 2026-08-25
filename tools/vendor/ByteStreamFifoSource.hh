@@ -88,6 +88,12 @@ private:
     unsigned char* fPendingData;
     unsigned fPendingLen;
     unsigned fPendingOff;
+
+    // Diagnostic tee: when the F2F_TEE env var names a file, every byte
+    // served (drain tail + fifo reads) is also written there, so the
+    // server's exact input can be byte-diffed against the producer's
+    // file dump to localize RTSP-path corruption.
+    FILE* fTee;
 };
 
 #endif
