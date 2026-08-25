@@ -1,5 +1,11 @@
 backup/
-analysis/
+
+# analysis/ is a scratch area: firmware dumps, ring snapshots, decoded h264.
+# Ignore its contents, but keep the write-ups and the small tools they cite.
+analysis/*
+!analysis/*.md
+!analysis/verify_fshare_map.py
+!analysis/slotwatch.c
 
 # build artifacts (reproducible via tools/build-*.sh in WSL)
 src/fshare2fifo/fshare2fifo
