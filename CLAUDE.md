@@ -264,12 +264,17 @@ producer blocking). The vendored RTPInterface now drops such a client's
 RTP stream instead of blocking (RTSP_DROP_LOG=1 logs it); verified with
 a raw-socket client that streams then stops reading.
 
-**Known remaining issue**: in the hyperactive eras (~1000 records/s;
-the app's most stressed state) the NAL-mode walk can churn on
-join/jump cycles and the stream stutters, and the source's own output
-carries decode errors in those eras. The record-mode walk handles the
-hyperactive era cleanly (drops 0, no re-join cycles) but requires
-records; the NAL-era equivalent is the open hard case.
+**Known remaining issue**: in the hyperactive eras (~600 KB-1 MB/s
+bursts; the ring laps every ~3 s) the NAL-mode walk still churns on
+join/jump cycles (~1 re-join per 6 s) and the source's own output
+carries decode errors in those eras. The 2026-08-25 fixes (the diff
+sampler anchored to the 0x0C reservation frontier with re-seed + the
+jitter clamp, and the 4-byte start-code scan) eliminated the measured
+backward OSD jumps (3 per 60 s -> 0 in two 90 s runs) and raised the
+emit ceiling to ~500 KB/s, but the churn and the low readable-frame
+fraction remain. The record-mode walk handles the hyperactive era
+cleanly (drops 0) but requires records; the NAL-era equivalent is
+still the open hard case.
 
 ## Backup
 

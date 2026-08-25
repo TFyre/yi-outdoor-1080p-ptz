@@ -216,24 +216,57 @@ static int is_nal_type(uint8_t b)
 /* Find the next start code (00 00 01) at or after *pos, wrapping at the
  * end of the buffer. If "typed", only start codes of accepted NAL types
  * match; otherwise any byte counts. Returns 1 and sets *pos, or 0 if the
- * whole ring was scanned without a hit. */
+ * whole ring was scanned without a hit.
+ *
+ * Four bytes per iteration via the zero-byte trick (a word contains a
+ * 0x00 byte iff (w - 0x01010101) & ~w & 0x80808080): the byte-wise
+ * scan capped the NAL walk at ~250-300 KB/s on the ARM1176, under the
+ * hyperactive writer's ~800 KB/s - the walk fell behind, MAX_LAG fired
+ * in a loop, and every re-join churned (the record walk survives the
+ * same eras because it jumps record-to-record without scanning). */
 static int next_sc(size_t *pos, int typed)
 {
     size_t p = *pos;
     size_t scanned = 0;
 
     while (scanned < buf_size) {
-        if (p + 4 > buf_size) {          /* wrap */
+        size_t n;
+
+        if (p >= buf_size)                /* wrap */
             p = 0;
+        n = buf_size - p;
+        while (n >= 4) {
+            uint32_t w;
+            memcpy(&w, (const void *)(buf + p), 4);
+            if (((w - 0x01010101u) & ~w & 0x80808080u) != 0) {
+                size_t k;
+                for (k = 0; k < 4 && p + k + 3 < buf_size; k++) {
+                    if (buf[p + k] == 0x00 && buf[p + k + 1] == 0x00 &&
+                        buf[p + k + 2] == 0x01 &&
+                        (!typed || is_nal_type(buf[p + k + 3]))) {
+                        *pos = p + k;
+                        return 1;
+                    }
+                }
+            }
+            p += 4;
+            n -= 4;
+            scanned += 4;
+            if (scanned >= buf_size)
+                return 0;
         }
-        if (p + 4 <= buf_size &&
-            buf[p] == 0x00 && buf[p + 1] == 0x00 && buf[p + 2] == 0x01 &&
-            (!typed || is_nal_type(buf[p + 3]))) {
-            *pos = p;
-            return 1;
+        /* 0-3 tail bytes before the wrap */
+        while (n > 0) {
+            if (p + 3 <= buf_size && buf[p] == 0x00 &&
+                buf[p + 1] == 0x00 && buf[p + 2] == 0x01 &&
+                (!typed || is_nal_type(buf[p + 3]))) {
+                *pos = p;
+                return 1;
+            }
+            p++;
+            n--;
+            scanned++;
         }
-        p++;
-        scanned++;
     }
     return 0;
 }
@@ -786,9 +819,97 @@ static uint32_t update_head(void)
                                        * SIGKILLed live during the app's
                                        * bursts). */
 
+/* The reservation frontier (hdr 0x0C) advances in lockstep with the
+ * writer, a few KB ahead of the actual bytes. The ring carries a
+ * SECOND write region (the 0x04 band at the file top) whose changes
+ * the window can catch instead - the head then flaps between the two
+ * regions by hundreds of KB (agelog 2026-08-25: quantized 512 KB-1 MB
+ * dist swings, the gate blocking/opening erratically, MAX_LAG firing
+ * in a loop, and every re-join landing on an old chain = the OSD
+ * clock rewind). Anchor the sampler to the frontier: a candidate head
+ * farther than one window behind 0x0C belongs to the other region -
+ * re-seed the window under the frontier and wait a tick. */
+#define RESERVE_NEAR (256u * 1024)
+
+static size_t dist_to_head_cached(size_t pos, uint32_t head);
+
+static uint32_t settled_0c(void)
+{
+    uint32_t a, b;
+    memcpy(&a, (const void *)(buf + 12), sizeof(a));
+    usleep(10 * 1000);
+    memcpy(&b, (const void *)(buf + 12), sizeof(b));
+    return a == b ? a : 0;
+}
+
+static uint32_t frontier_base(uint32_t r0)
+{
+    uint32_t half = DIFF_WIN / 2;
+    if (r0 >= half)
+        return r0 - half;
+    return (uint32_t)(buf_size + r0 - half);
+}
+
+/* Tear-checked copy of the window [base, base+DIFF_WIN) into the
+ * shadow (the same bounded double-copy as the scan refresh). */
+static void reshadow(uint32_t base)
+{
+    size_t q = base, left = DIFF_WIN, sdx = 0;
+
+    while (left > 0) {
+        size_t n;
+        if (q >= buf_size)
+            q = 0;
+        n = buf_size - q;
+        if (n > left)
+            n = left;
+        if (q < DATA_BASE) {
+            size_t skip = DATA_BASE - q;
+            if (skip > n)
+                skip = n;
+            q += (uint32_t)skip;
+            sdx += skip;
+            left -= skip;
+            continue;
+        }
+        {
+            int tries;
+            for (tries = 0; tries < 3; tries++) {
+                size_t off = 0;
+                int clean = 1;
+                for (off = 0; off + TEAR_CHUNK <= n; off += TEAR_CHUNK) {
+                    memcpy(shadow + sdx + off,
+                           (const void *)(buf + q + off), TEAR_CHUNK);
+                    memcpy(shadow2, (const void *)(buf + q + off),
+                           TEAR_CHUNK);
+                    if (memcmp(shadow + sdx + off, shadow2, TEAR_CHUNK)) {
+                        clean = 0;
+                        break;
+                    }
+                }
+                if (clean && off < n) {
+                    memcpy(shadow + sdx + off,
+                           (const void *)(buf + q + off), n - off);
+                    memcpy(shadow2, (const void *)(buf + q + off),
+                           n - off);
+                    if (memcmp(shadow + sdx + off, shadow2, n - off))
+                        clean = 0;
+                }
+                if (clean)
+                    break;
+            }
+        }
+        q += (uint32_t)n;
+        sdx += n;
+        left -= n;
+    }
+}
+
 static void *diff_thread(void *arg)
 {
     uint32_t base = DATA_BASE;
+    uint32_t last_r0 = 0;
+    unsigned r0_stale = 0;
     (void)arg;
 
     usleep(250 * 1000);
@@ -801,6 +922,27 @@ static void *diff_thread(void *arg)
         unsigned changed = 0;
         int run = 0;
         size_t i;
+        uint32_t r0;
+
+        /* The reservation frontier anchors the head (see RESERVE_NEAR):
+         * a frontier frozen for > 1 s is a dead signal (the slots
+         * freeze in some eras) - drop the anchor rather than chase it.
+         * The slot signal also jitters a few KB BACKWARD between
+         * updates (the same jitter the slot path clamps with
+         * JITTER_MAX) - clamp it here or the anchor follows it and the
+         * head flaps with it. */
+        r0 = settled_0c();
+        if (r0 == last_r0) {
+            if (r0 != 0 && ++r0_stale > 4)
+                r0 = 0;
+        } else if (r0 != 0 && last_r0 != 0 && r0 < last_r0 &&
+                   last_r0 - r0 < JITTER_MAX) {
+            r0 = last_r0;
+            r0_stale = 0;
+        } else {
+            r0_stale = 0;
+            last_r0 = r0;
+        }
 
         while (left > 0) {
             size_t n;
@@ -884,12 +1026,31 @@ static void *diff_thread(void *arg)
             left -= n;
         }
         if (run) {
+            uint32_t cand = (run1 + 1 >= buf_size) ? DATA_BASE : run1 + 1;
             if (f2f_trace())
                 fprintf(stderr,
-                        "diff: base=0x%x run1=0x%x changed=%u\n",
-                        (unsigned)base, (unsigned)run1, changed);
-            base = (run1 + 1 >= buf_size) ? DATA_BASE : run1 + 1;
-            diff_head = base;
+                        "diff: base=0x%x run1=0x%x changed=%u r0=0x%x\n",
+                        (unsigned)base, (unsigned)run1, changed,
+                        (unsigned)r0);
+            if (r0 != 0 && dist_to_head_cached(cand, r0) > RESERVE_NEAR) {
+                /* The change sits far behind the frontier: the window
+                 * caught the other write region (the 0x04 band) or a
+                 * stale re-seed. Do NOT move the head - re-anchor the
+                 * window under the frontier; the next tick converges
+                 * on the true writer. */
+                base = frontier_base(r0);
+                reshadow(base);
+            } else {
+                base = cand;
+                diff_head = base;
+            }
+        } else if (r0 != 0 &&
+                   dist_to_head_cached(base, r0) > DIFF_WIN) {
+            /* No changes in the window but the frontier is far ahead:
+             * the writer outran the window (or the base sits in the
+             * wrong region) - re-anchor under the frontier. */
+            base = frontier_base(r0);
+            reshadow(base);
         }
         usleep(250 * 1000);
     }
