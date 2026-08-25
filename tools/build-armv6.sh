@@ -48,6 +48,10 @@ build_rtspserver() {
     mkdir -p "$LIVE/src"
     cp "$SRC/include/"*.hh "$LIVE/liveMedia/include/"
     cp "$SRC/src/"*.cpp "$LIVE/src/"
+    # Vendored fixes on top of the upstream tree (the tree is gitignored;
+    # everything we change must live here or a fresh clone loses it):
+    cp "$REPO/tools/vendor/H264VideoFifoServerMediaSubsession.hh" "$LIVE/liveMedia/include/"
+    cp "$REPO/tools/vendor/H264VideoFifoServerMediaSubsession.cpp" "$LIVE/src/"
     cp "$REPO/tools/vendor/ADTSAudioStreamDiscreteFramer.hh" "$LIVE/liveMedia/include/"
     cp "$REPO/tools/vendor/ADTSAudioStreamDiscreteFramer.cpp" "$LIVE/liveMedia/"
     cp "$REPO/tools/vendor/ByteStreamFifoSource.hh" "$LIVE/liveMedia/include/"
@@ -92,7 +96,14 @@ EOF
     make \
         CC=${CROSS}-gcc CXX=${CROSS}-g++ \
         CFLAGS="$FLAGS" CXXFLAGS="$FLAGS" LDFLAGS="$FLAGS"
-    ${CROSS}-strip rRTSPServer
+    # strip copies-then-renames; on DrvFs a freshly linked binary is often
+    # briefly locked (Windows Defender) - retry rather than fail the build.
+    ok=0
+    for i in 1 2 3 4 5; do
+        if ${CROSS}-strip rRTSPServer; then ok=1; break; fi
+        sleep 1
+    done
+    [ "$ok" = "1" ] || { echo "strip failed after 5 retries" >&2; exit 1; }
     verify_armv6 rRTSPServer
     ls -la rRTSPServer
 }
