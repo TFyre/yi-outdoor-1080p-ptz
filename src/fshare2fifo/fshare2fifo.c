@@ -543,6 +543,9 @@ static uint32_t head_live_fctr;        /* frame counter at the last advance */
  * authoritative in every mode once the sampler has produced it. */
 #define DATA_BASE 0x100               /* below this is header/slots only */
 static uint8_t *shadow;               /* last sampled copy of the ring */
+static uint8_t *shadow2;              /* tear-check twin: a second read of
+                                       * the live ring; identical copies
+                                       * prove neither was torn by a lap */
 static volatile uint32_t diff_head;   /* newest write position seen */
 
 static uint32_t update_head(void)
@@ -684,8 +687,30 @@ static void *diff_thread(void *arg)
              * window wraps past the buffer end, and without this the
              * wrapped portion compares against a startup-era shadow -
              * false changes there yanked the head backward by hundreds
-             * of KB and made the walk chase garbage. */
-            memcpy(shadow + q, (const void *)(buf + q), n);
+             * of KB and made the walk chase garbage. A single memcpy of
+             * the live region can be TORN by a ring lap under it; the
+             * next diff then reads the mixed bytes as a changed run
+             * AHEAD of the true head, the completeness gate trusts it,
+             * and the walk emits a region the writer is mid-writing
+             * (measured: one 21 KB false advance per ~2 s). Two copies
+             * that agree byte-for-byte can't both be torn. The writer
+             * is often active INSIDE the chunk, so unbounded retries
+             * livelock (the copies straddle the moving write point and
+             * never agree - verified: the diff thread spun, the head
+             * froze, and every emitted slice was torn). Bound the
+             * retries: on failure leave the shadow stale - the stale
+             * direction only makes the next diff see MORE changes, all
+             * at or behind the true head (safe); a torn refresh could
+             * seed false changes ahead of it instead. */
+            {
+                int tries;
+                for (tries = 0; tries < 3; tries++) {
+                    memcpy(shadow + q, (const void *)(buf + q), n);
+                    memcpy(shadow2 + q, (const void *)(buf + q), n);
+                    if (!memcmp(shadow + q, shadow2 + q, n))
+                        break;
+                }
+            }
             q += (uint32_t)n;
             left -= n;
         }
@@ -1303,6 +1328,34 @@ static int write_whole_fd(int fd, const void *p, size_t n)
 #define NAL_COPY_MAX (512u * 1024)
 static uint8_t nal_copy[NAL_COPY_MAX + 4];  /* + 4-byte start code prefix */
 
+/* Tear check for a copy just made of ring[s, s+len): re-read the region
+ * and compare. The writer overwrites the ring in place, so if it moved
+ * into the region between the copy and the re-read, the bytes diverge
+ * and the copy is a pre/post-lap mix. This is the emission-side safety
+ * net for any head-signal error (the sampler's gate is the primary line
+ * of defense; a measured residual false advance was ~21 KB, producing
+ * one torn slice per ~2 s). */
+static int copy_was_torn(size_t s, size_t len, const uint8_t *copied)
+{
+    /* Same byte mapping as copy_nal: the body starts at s+3 (the ring's
+     * 3-byte start code convention) and wraps with the ring. */
+    size_t done = 0;
+    size_t q = s + 3;
+    while (done < len) {
+        size_t n;
+        if (q >= buf_size)
+            q -= buf_size;
+        n = buf_size - q;
+        if (n > len - done)
+            n = len - done;
+        if (memcmp(copied + done, (const void *)(buf + q), n) != 0)
+            return 1;
+        done += n;
+        q += n;
+    }
+    return 0;
+}
+
 /* Emit one NAL (ring positions s..e) as 4-byte start code + body,
  * handling the ring wrap. Returns 0, -1 (would block), or -2 (error).
  * A long block here is just fifo backpressure: the walk sprinted a
@@ -1327,6 +1380,10 @@ static int emit_nal(size_t s, size_t e)
         len = copy_nal(s, e, nal_copy + 4, NAL_COPY_MAX);
         if (len == 0)
             return -2;
+        if (copy_was_torn(s, len, nal_copy + 4))
+            return -1;                /* writer moved under the copy: drop
+                                       * the NAL (concealable gap), never
+                                       * emit a pre/post-lap byte mix */
         /* Start code + body as ONE buffer so slices go out in a single
          * whole-or-drop write (write_whole_fd); chains (SPS/PPS/IDR)
          * wait for fifo space - see write_all_fd_wait. */
@@ -1362,6 +1419,8 @@ static int emit_nal(size_t s, size_t e)
         size_t len = copy_nal(s, e, nal_copy + 4, NAL_COPY_MAX);
         if (len == 0)
             return -2;
+        if (copy_was_torn(s, len, nal_copy + 4))
+            return -1;                /* same drop as the fifo path */
         memcpy(nal_copy, start4, sizeof(start4));
         if (fwrite(nal_copy, 1, len + 4, out) != len + 4)
             return -2;
@@ -1760,9 +1819,20 @@ int main(int argc, char **argv)
     /* Writer-position sampler: its shadow starts as a copy of the ring
      * now, so the first diff sees everything written since startup. */
     shadow = malloc(buf_size);
-    if (shadow) {
+    shadow2 = malloc(buf_size);   /* tear-check twin (see diff_thread) */
+    if (shadow && shadow2) {
         pthread_t diff_tid;
-        memcpy(shadow, (const void *)buf, buf_size);
+        int tries;
+        for (tries = 0; tries < 5; tries++) {
+            memcpy(shadow, (const void *)buf, buf_size);
+            memcpy(shadow2, (const void *)buf, buf_size);
+            if (!memcmp(shadow, shadow2, buf_size))
+                break;   /* two identical reads of a live ring are clean */
+        }
+        /* Never clean (the writer never paused): keep the last copy. The
+         * first diff's full-ring scan refreshes the shadow as it goes,
+         * and emit_nal's tear check catches any corrupted emission that
+         * a torn startup shadow could otherwise let through. */
         pthread_create(&diff_tid, NULL, diff_thread, NULL);
     }
 
