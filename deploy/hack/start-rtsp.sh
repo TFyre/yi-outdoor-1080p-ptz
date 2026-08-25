@@ -55,4 +55,27 @@ if [ -z "$PID" ]; then
 fi
 
 echo "rtsp chain up"
-exit 0
+
+# Watch loop: the producer is a sitting duck for the OOM killer (35 MB
+# RAM total; the app's encode bursts have SIGKILLed it - exit 137), and
+# the server can die when the fifo briefly loses its writer mid-restart.
+# Respawn either idempotently so the chain self-heals without a reboot.
+# This script runs detached from boot.sh, so the loop lives for the
+# whole uptime.
+while :; do
+  PID=$(pidof fshare2fifo)
+  if [ -z "$PID" ]; then
+    echo "producer gone - respawning"
+    nohup $BIN/fshare2fifo >>/tmp/fshare2fifo.log 2>&1 &
+    sleep 3
+    continue
+  fi
+  PID=$(pidof rRTSPServer)
+  if [ -z "$PID" ]; then
+    echo "server gone - respawning"
+    nohup $BIN/rRTSPServer -a no >/tmp/rtsp.log 2>&1 &
+    sleep 2
+    continue
+  fi
+  sleep 5
+done
