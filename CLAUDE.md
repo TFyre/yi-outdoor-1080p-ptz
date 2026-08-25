@@ -60,9 +60,12 @@ on the SD root is a one-liner that execs `hack/boot.sh` at every boot.
   creates it once the camera pipeline is up), then starts the chain in
   this order: **rRTSPServer first** (its startup drain discards buffered
   fifo content, so it must open the fifo before the producer writes), then
-  **fshare2fifo** (retried until it survives). Idempotent. Limitation: if
-  rmm restarts mid-uptime and recreates its buffer, the producer's mmap
-  goes stale — re-run the script or reboot.
+  **fshare2fifo** (retried until it survives). Idempotent. Then a watch
+  loop runs for the whole uptime: it respawns the producer (a sitting
+  duck for the OOM killer) or the server (dies when the fifo briefly
+  loses its writer) whenever either disappears. Limitation: if rmm
+  restarts mid-uptime and recreates its buffer, the producer's mmap goes
+  stale — re-run the script or reboot.
 - `hack/bin/` — binaries, all static armv6 (gitignored, rebuilt with
   `tools/build-*.sh` in WSL): busybox 1.38.0, curl 8.21.0 (http-only, no
   TLS), dropbearmulti 2026.94 (built from source), fshare2fifo, rRTSPServer.
@@ -117,16 +120,17 @@ does NOT use a fixed byte gap (bitrate-blind: 192 KB ≈ 27 s of content at
 an ultra-static ~7 KB/s scene — the observed 13 s latency). It emits a
 NAL only when its END lies ≥ NAL length + 128 B before the writer's
 position signal — provably complete, ~one frame old at ANY bitrate. The
-writer's position comes from a 250 ms ring-diff sampler (shadow copy +
-memcmp; the top of the newest changed run IS the write head in every
-ring mode); the c0-checkpoint forward scan and the header slots
-(0x04/0x08/0x0C/0x10, jitter-clamped) are the seed/fallback. A join (or
-a MAX_LAG escape after a client stall) emits the newest chain then jumps
-to just behind the head — the mid-GOP backlog is dropped, because the
-fifo drains at the writer's own rate and a backlog can never be closed
-by sprinting it (measured: sprint → lag equilibrium). There is no
-time-based lap re-sync — it fired on sprint blocks and looped forever
-(sprint → block ≥1.1 s → re-sync → sprint). Per-second diagnostics:
+writer's position comes from a 250 ms ring-diff sampler (a 256 KB moving
+shadow window, tear-checked — see below; the top of the newest changed
+run IS the write head in every ring mode); the c0-checkpoint forward
+scan and the header slots (0x04/0x08/0x0C/0x10, jitter-clamped) are the
+seed/fallback. A join (or a MAX_LAG escape after a client stall) emits
+the newest chain then jumps to just behind the head — the mid-GOP
+backlog is dropped, because the fifo drains at the writer's own rate
+and a backlog can never be closed by sprinting it (measured: sprint →
+lag equilibrium). There is no time-based lap re-sync — it fired on
+sprint blocks and looped forever (sprint → block ≥1.1 s → re-sync →
+sprint). Per-second diagnostics:
 `F2F_AGELOG=1` logs pos/head/dist/emission/block stats.
 
 **Ring format (reverse-engineered from live captures, commit 1677010)**:
@@ -195,11 +199,43 @@ keeps running, and the header slots freeze when the writer reaches the
 buffer end — the ring-diff sampler in the producer tracks the writer
 through all of it (legacy; the record walk no longer needs it).
 
-**Known remaining issue**: ~1 decode error per ring lap in the
-hyperactive era (~1000 records/s; the app's most stressed state) —
-the offline x86 harness reproduces it; the sim's equivalent walk on
-the same snapshot decodes clean, so the divergence is a C-only subtlety
-not yet pinned.
+**The delivery layer is exonerated (2026-08-25)**: with F2F_TEE set,
+the vendored ByteStreamFifoSource writes every byte it serves to a
+file — decoded locally, the server's exact input showed the same error
+signatures as the client (identical MB/bytestream lines), so the fifo
+reads, framer, RTP, and TCP add zero corruption. An era-matched
+file-mode dump of the producer's own walk decoded 481 frames with 0
+errors — when the ring is clean, the chain is clean; the residual
+decode errors are the app's own stressed-era output (the hyperactive
+encoders), not the chain.
+
+**Tear protection (commits 49e04b7/3f44cf9)**: the sampler's shadow
+copies are double-copy tear-checked (bounded retries — the unbounded
+version livelocked when the writer stayed inside the copy window), and
+emit_nal re-reads its copy and drops a torn NAL as a concealable gap.
+Before this, a torn shadow refresh seeded a false head advance and the
+walk emitted one ~21 KB pre/post-lap byte mix per ~2 s. The shadow is
+a 256 KB moving window, not a full-ring copy: the 1.79 MB shadow made
+the producer the OOM killer's victim (exit 137, silent, during the
+app's bursts — dmesg on this unit doesn't log OOM kills).
+
+**Server-side delivery fixes (commits 8a444e8/6f7b205)**: the fifo
+subsession passed playTimePerFrame=50000 us, which made the RTP sink
+pace EACH PACKET by 50 ms — 12 s stalls between reads, ffplay's frozen
+single frame (zeroed). And a client that stops reading (paused player)
+filled the TCP window; the blocking retry send wedged the
+single-threaded event loop — one slow client froze the whole camera
+(measured: ~56 KB stuck in the tx_queue, the fifo filling, the
+producer blocking). The vendored RTPInterface now drops such a client's
+RTP stream instead of blocking (RTSP_DROP_LOG=1 logs it); verified with
+a raw-socket client that streams then stops reading.
+
+**Known remaining issue**: in the hyperactive eras (~1000 records/s;
+the app's most stressed state) the NAL-mode walk can churn on
+join/jump cycles and the stream stutters, and the source's own output
+carries decode errors in those eras. The record-mode walk handles the
+hyperactive era cleanly (drops 0, no re-join cycles) but requires
+records; the NAL-era equivalent is the open hard case.
 
 ## Backup
 
