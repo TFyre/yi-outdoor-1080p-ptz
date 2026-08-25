@@ -1745,6 +1745,18 @@ static int drain_round(size_t *pos, uint32_t head, int force)
         len = (e > s) ? (e - s - 3) : (buf_size - s - 3 + e);
         if (!force) {
             if (head != 0) {
+                /* A NAL whose start is AT or past the head is stale
+                 * content AHEAD of the writer: the jump can land on a
+                 * spot with no start code, the next SC then lies
+                 * beyond the head, and its WRAPPED distance looked
+                 * like a wide-open gate - the walk sprinted the stale
+                 * region, the wrapped distance tripped MAX_LAG, and
+                 * the re-join looped (the offline content looping,
+                 * and the live OSD-timestamp rewind). Wait instead;
+                 * the writer passes the position and the gate opens
+                 * normally. */
+                if (s >= head)
+                    return 0;
                 if (dist_to_head_cached(s, head) < len + 3 + NAL_FLOOR)
                     return 0;         /* may be in flight: wait */
             } else if (frame_counter() == hb) {
