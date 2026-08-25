@@ -133,6 +133,23 @@ sprint blocks and looped forever (sprint → block ≥1.1 s → re-sync →
 sprint). Per-second diagnostics:
 `F2F_AGELOG=1` logs pos/head/dist/emission/block stats.
 
+**The slot protocol (the ring's real contract, discovered 2026-08-25,
+commit 57e4e2d)**: the app coordinates `fshare_frame_buf` with named
+POSIX semaphores in /dev/shm: `sem.fshare_write_lock` +
+`sem.fshare_read_lock` (both value 1) and 17 per-slot notifies
+`sem.fshare_read_notify_0..16` (all value 0). The app's own consumers
+(tserver, mp4record) register as readers, hold a slot, and wait on its
+notify; the ring header holds two reader cursors (0x0C/0x10, ~2 KB
+apart, moving together) plus the frame counter (0x18) and a second
+counter (0x24). fshare2fifo uses NONE of it — a blind diff-walk reader.
+The semprobe (src/ring-capture/semprobe.c) saw zero posts on all 17
+slots in 2 s each: posts are targeted at registered/lagging readers,
+not broadcast, so a reader must register to get data. The reader-side
+protocol is being reverse-engineered from the tserver disassembly into
+`analysis/fshare-protocol.md`; the goal is fshare2fifo v2: register,
+wait on the notify, read exactly the signaled frame (see also
+`src/ring-capture/slotprobe.c`, the live read-only mapper).
+
 **Ring format (reverse-engineered from live captures, commit 1677010)**:
 the ring carries TWO interleaved H.264 streams — the target 1920×1088
 (SPS level 0x29, P-slices `41 9a 00 …`, IDRs `65 88 80 …`) and a second
