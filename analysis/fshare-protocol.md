@@ -82,6 +82,63 @@ sizes its receive buffer as `hdr[0x08] + need`. That matches the observed
 behaviour exactly: a byte magnitude that only ever increases
 (228720 → 236048 → 276961).
 
+### `0x04`, `0x0C` and `0x10` are one quantity, not three
+
+`head = tail + valid`, always. Verified on every capture:
+
+```
+ring_now2.bin  (0x0C-0x04) mod 0x1B4000 = 1350648   0x10 = 1350648   match=True
+ring_n.bin                                1696257          1696257   match=True
+ring_l.bin                                 935247           935247   match=True
+ring_k.bin                                 996265           996265   match=True
+```
+
+That identity explains the three things that make `0x04` look mysterious when
+you watch it move:
+
+- **It advances in exact lockstep with `0x0C`.** While the tail is stationary,
+  `Δhead = Δvalid` by definition. Same deltas, same audio pacing.
+- **It sits in a band whose ceiling is 1.786M.** The ceiling *is* `0x1B4000` =
+  1785856: `valid` is capped at the ring size, and the writer keeps the ring
+  essentially full, so `0x04` oscillates just under the cap.
+- **Its offset from `0x0C` is piecewise-constant.** That offset *is the tail*:
+  `(0x0C − 0x04) mod 0x1B4000 == 0x10`. It steps only when the writer pops to
+  make room — which is the same observation as "`0x10` freezes for seconds
+  then leaps".
+
+### The commit point, and why `0x0C` looks like a reservation frontier
+
+`rmm`'s `fshare_write` publishes the header fields **before** copying the
+record bytes, all inside one `write_lock` critical section:
+
+```
+5fd60  bl sem_wait          <- take /fshare_write_lock
+5fdcc  str r2, [r4, #4]     <- 0x04 valid      published
+5fdec  str r2, [r4, #4]         (pop path / fast path)
+5fe10  str r2, [r4, #24]    <- 0x18 seq        published
+5fe18  str r7, [r4, #12]    <- 0x0C head       published
+5fe70  bl 5f678             <- ring_copy: the record bytes are written HERE
+5fe7c  bl 5f678                 (extras)
+5fe88  bl 5f678                 (payload)
+5fefc  bl sem_post              (notify, per matching slot)
+5ff18  bl sem_post          <- release /fshare_write_lock
+```
+
+So there are two different answers depending on how you look:
+
+- **Read lock-free, `0x0C` is a reservation frontier.** It can lead the actual
+  bytes by up to one whole record. In the current era the largest record is
+  36138 B and the p99 is 5418 B, which brackets the measured "leads by 6–11 KB"
+  exactly — that lead is one in-flight video record, not a systematic offset.
+- **Read under `read_lock`, `0x0C` is an exact commit point.** A reader holding
+  `read_lock` holds `write_lock` too (first-reader rule, §4), so the writer
+  cannot be inside that window. Every byte behind `0x0C` is committed.
+
+**There is no per-stream committed end.** One ring, one head, one tail; hi-res,
+low-res and audio are interleaved as typed records and share all three
+pointers. The hi-res "end" is just the newest record with `type & 0x0400`, and
+the walk finds it by filtering, not by a separate pointer.
+
 > **There is no counter at `0x24`.** Offset `0x24` is `0x1C + 8` — it is
 > **`slot[0].cursor`**, inside the first reader slot. The long-standing note
 > about "a second counter at 0x24 tracking the frame counter" was reading one
@@ -151,12 +208,28 @@ numbers are contiguous with **no gaps**, and the final record's `seq` and `ts`
 match `hdr[0x18]` and `hdr[0x14]` bit for bit. That is a complete framing
 proof.
 
-It also settles an old question: **there is no "raw Annex-B mode" and there are
-no `00 00 01 c0` table entries.** The ring is record-framed 100% of the time.
-The "modes" in `CLAUDE.md` were the blind walker mis-syncing. The earlier
-hand-derived header was also shifted: what was read as `[2:6] counter` is
-`+4 seq`, `[14:18] ts` is `+16`, `[18:20] type` is `+20`, and the header is 26
-bytes, not 24 or 25.
+Re-validated on a capture taken in the era that a full-ring marker scan called
+"raw Annex-B, zero record markers":
+
+```
+ring_now2.bin: entries=2734  remaining_budget=0  seq_contiguous=True
+               seq 543593..546326  (hdr 0x18=546326, match=True)
+               last_ts=982145806   (hdr 0x14=982145806, delta=0)
+               types: 0x0100x1011 0x0400x779 0x0800x779
+                      0x0822x28 0x0804x28 0x0801x28 0x0422x27 0x0404x27 0x0401x27
+```
+
+Still perfectly record-framed. So **there is no "raw Annex-B mode" and there
+are no `00 00 01 c0` table entries** — the ring is record-framed 100% of the
+time, and a scan that finds zero markers is looking at the wrong offset. The
+earlier hand-derived header was shifted by two: what was read as `[2:6]
+counter` is `+4 seq`, `[14:18] ts` is `+16`, `[18:20] type` is `+20`, and the
+header is 26 bytes, not 24 or 25. A magic-scan keyed to `+6` finds nothing;
+the magic is at `+8`.
+
+The same two-byte shift shows up in the pacing measurements: the "dominant
+196–197 B step at 7.1/s = 24-byte header + ~172-byte AAC" is this map's median
+record of **197 B = 26-byte header + 171-byte AAC**. Same bytes, same rate.
 
 ### Type field and the subscription filter
 
@@ -591,32 +664,70 @@ Collateral damage is bounded, though: the writer's only per-slot action is
 mis-set slot cannot corrupt the ring or wedge `rmm` — it can only starve or
 confuse the reader that owns the slot.
 
-### Cross-libc hazard — and damage we have already done
+### The notify semaphores are currently BROKEN, and we broke them
 
-The camera's app is uClibc; our binaries are static musl. These `sem_t`s live in
-shared memory, so both libcs' encodings have to agree, and there is direct
-evidence they do not.
+This is not a latent hazard. It is live damage, and it is ours.
 
-`rmm` creates the notify semaphores with value **0** and never writes them
-again except via `sem_post`. Their backing word should therefore read `0` at
-rest. Instead **all 17 read `-1 0 0 0`** — while `write_lock` and `read_lock`,
-which none of our probes ever waited on, read a clean `1 0 0 0`. musl's
-`sem_timedwait` does `a_cas(sem->__val, 0, -1)` before blocking and does not
-restore the word on timeout, and `semprobe` timed-waited all 17.
+**uClibc's `sem_t` layout**, read out of the camera's own
+`/lib/libpthread.so.0` (it exports symbols):
 
-The clincher is that 14 of those 17 slots have `filter == 0`, so by §6 no
-reader can ever park on them and no legitimate `-1` is possible there. **That
-`-1` is residue our own probe left in the app's semaphores.** Under uClibc the
-word may read as an enormous unsigned count, which would make `sem_wait` return
-instantly and turn a parked reader into a spinner.
+| Word | Field | Proof |
+|---|---|---|
+| 0 | `value` | `__new_sem_init+0x60`: `str r2, [r0]` |
+| 1 | `private` — 128 when process-private, 0 when shared | `stmib r0, {r1, r3}`, `moveq r1, #128` |
+| 2 | `nwaiters` | `__new_sem_wait+0xb8`: `ldr r3, [r4, #8]` / `add r1, r3, #1` |
+| 3 | unused | — |
 
-No harm is currently observable — nothing is spinning, and `top` is dominated
-by our own `fshare2fifo` — and `/dev/shm` is tmpfs, so **a reboot clears it**.
-Before v2 depends on these semaphores: confirm the two libcs agree on the
-on-disk `sem_t`, and prefer a hand-rolled futex wait on the raw word over
-musl's wrappers. The safe fallback is to skip `notify[K]` entirely and poll
-`slot[K].pending` on a short timer — correctness does not depend on the
-semaphore, only latency does.
+`__new_sem_getvalue` returns word 0 **raw and unclamped** (`ldr r2, [r0]; str
+r2, [r1]`). And the decisive instruction, `__new_sem_wait+0x78`:
+
+```
+5944:  ldr r3, [r4]        ; value
+5948:  cmp r3, #0
+594c:  beq 59d8            ; ONLY value == 0 goes to the futex-wait path
+5950:  sub r1, r3, #1      ; otherwise decrement and return success
+```
+
+**uClibc blocks only when the value is exactly zero.** Any other value —
+including `0xFFFFFFFF` — makes `sem_wait` return immediately.
+
+`rmm` creates all 17 notify semaphores with value **0**. They now read:
+
+```
+notify_0 : 4294967295          (0xFFFFFFFF, untouched)
+notify_1 : 4197658095 -> 4196341853 over 5 s   (-1,316,242 = ~263,000/s)
+notify_2 : 4292755546          (static)
+notify_3 : 4294967295          (0xFFFFFFFF — a FREE slot, filter == 0)
+write_lock: 1     read_lock: 0
+```
+
+`notify_3` is the proof of authorship: `filter == 0`, so by §6 no reader can
+ever park on it and no `sem_post` can ever target it. Nothing in the app has
+touched that word since creation — yet it reads `0xFFFFFFFF` instead of `0`.
+That is exactly what musl's `sem_timedwait` writes (`a_cas(sem->__val, 0, -1)`
+before blocking, not restored on timeout), and `semprobe` timed-waited all 17.
+
+The consequence is `notify_1`: **~263,000 decrements per second.** Slot 1's
+reader (filter `0x0D00`) calls `sem_wait`, never blocks, loops in
+`fshare_wait`, and burns CPU — taking `read_lock` (and therefore `write_lock`)
+on every iteration. `mp4record` is in state `R` at 16% CPU on a box that is at
+load 6.3 with 0% idle. It should be asleep.
+
+Two mitigations, in order of preference:
+
+1. **Reboot.** `/dev/shm` is tmpfs; the semaphores are recreated with value 0.
+   Clean, and the user reboots by hand anyway.
+2. **Wait it out.** At 263k/s the value drains from 4.2 G to 0 in roughly four
+   hours, at which point the semaphore self-heals. Not recommended.
+
+Do not "fix" it by storing 0 into the word: a reader is concurrently
+`ldrex`/`strex`-ing it, and it is app state.
+
+For v2: do not call musl's `sem_*` on these. Either implement `sem_wait`
+against the uClibc layout directly (decrement word 0 unless zero; on zero,
+`FUTEX_WAIT` on word 0 with `nwaiters` bumped), or — much safer — **skip the
+notify semaphore entirely and poll `slot[K].pending` on a short timer.**
+Correctness never depends on the semaphore; only wakeup latency does.
 
 ## 8. What stays unproven
 
@@ -637,8 +748,10 @@ the overwrite policy, and most of the record header. What is left:
    (`slot[6]`, filter `0x0400`, did so today), but neither `tserver` nor
    `rmm`'s writer contains the code that clears one. Presumably a
    `fshare_unregister` in the reader library that `tserver` does not call.
-5. **`sem_t` compatibility between uClibc and musl** — see the hazard above.
-   Assumed incompatible on the evidence; not confirmed by reading uClibc.
+5. **Why `notify_2` is static while `notify_1` drains at 263k/s.** Both slots
+   are occupied and both cursors advance. Slot 2's reader is presumably parked
+   in something other than `fshare_wait`, or polls `pending` without ever
+   calling `sem_wait` (as `rmm`'s own internal readers do).
 6. **Slot ownership per process.** `mp4record`, `oss` and `p2p_tnp` map the
    ring but are UPX-packed, so their hardcoded indices were not read out.
    `rmm` also has two internal readers of its own (`0x5fff4`, `0x601f0`) which
