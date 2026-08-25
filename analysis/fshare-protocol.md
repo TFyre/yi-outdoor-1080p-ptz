@@ -4,11 +4,11 @@ Reverse-engineered 2026-08-25 from `/home/app/tserver` (stock firmware
 `5.0.00.00_202204281015`), then validated against live ring snapshots and the
 running camera.
 
-`tserver` is the ideal specimen: it is the only stock consumer that is **not**
-UPX-packed, it is 18 KB, and it carries a complete private copy of the fshare
-client code with the `fshare_open` / `fshare_create` / `fshare_write` log
-strings still in `.rodata`. Everything below marked *verified-in-asm* is read
-directly out of its instructions; addresses are `tserver` virtual addresses.
+`tserver` is the ideal specimen for the reader side: the only stock consumer
+that is **not** UPX-packed, 18 KB, carrying a complete private copy of the
+fshare client with the `fshare_open` / `fshare_create` / `fshare_write` log
+strings still in `.rodata`. The writer side (§6) comes from `/home/app/rmm`.
+Bare addresses are `tserver`'s; `rmm` addresses are marked as such.
 
 **Headline: the ring is not a byte stream that has to be re-synchronised.** It
 is a sequence-numbered record log with a published tail, a published length, a
@@ -22,10 +22,11 @@ to reconstruct information the header already publishes.
 
 | Tag | Meaning |
 |---|---|
-| **ASM** | Read directly from `tserver` instructions, cited inline |
+| **ASM** | Read directly from instructions, cited inline (`ASM(rmm)` = from the writer) |
 | **DATA** | Confirmed by parsing real ring snapshots and/or the live header |
-| **INF** | Inferred from strong but indirect evidence |
-| **HYP** | Hypothesis, not established |
+
+Every claim in §§1–7 carries one of those two. Anything that reaches neither
+bar is not stated as fact — it is listed in §8.
 
 ## 1. Objects
 
@@ -61,8 +62,8 @@ literal `0x001b3fff` (`0x12b74`, `0x12d30`).
 |---|---|---|---|
 | 0x00 | u32 | **active reader count** — readers-writer lock state | ASM |
 | 0x04 | u32 | **valid bytes** currently in the ring | ASM+DATA |
-| 0x08 | u32 | unidentified; a slowly-varying byte magnitude (228720 / 236048 / 276961 observed) | — |
-| 0x0C | u32 | **write head offset** = `(tail + valid) mod 0x1B4000` | DATA |
+| 0x08 | u32 | **max payload high-water mark**, class 0x0200 only; readers size their receive buffer from it | ASM(rmm) |
+| 0x0C | u32 | **write head offset** = `(tail + valid) mod 0x1B4000` | ASM(rmm)+DATA |
 | 0x10 | u32 | **tail offset** — the oldest surviving record | ASM+DATA |
 | 0x14 | u32 | **now timestamp** — equals the newest record's `+16` | ASM+DATA |
 | 0x18 | u32 | **newest sequence number** — equals the newest record's `+4` | ASM+DATA |
@@ -73,11 +74,20 @@ literal `0x001b3fff` (`0x12b74`, `0x12d30`).
 `(hdr[0x10] + hdr[0x04]) mod 0x1B4000 == hdr[0x0C]` exactly, every time. It is
 the write head — the position the next record header will occupy.
 
-`tserver` never reads `0x08`, so the disassembly cannot name it. It is stable
-across minutes and then steps; it is **not** a ring offset (no valid record
-header lives at `0x08`, at `head - 0x08`, or at `tail + 0x08`). The
-`fshare.%s: size(%d) > size_max(%d)` and `try_adjust_buf` strings suggest a
-capacity/reserve figure.
+`tserver` never reads `0x08`; `rmm` does. It is a **monotonic maximum of the
+payload length of class-0x0200 records** (`rmm` `0x5fe98`–`0x5feac`:
+`ldr r0,[r4,#8]; ldr r1,[r5,#16]; cmp r0,r1; strlt r1,[r4,#8]`, reachable only
+from the 0x0200 branch), and `rmm`'s reader-side `ensure_capacity` at `0x5f700`
+sizes its receive buffer as `hdr[0x08] + need`. That matches the observed
+behaviour exactly: a byte magnitude that only ever increases
+(228720 → 236048 → 276961).
+
+> **There is no counter at `0x24`.** Offset `0x24` is `0x1C + 8` — it is
+> **`slot[0].cursor`**, inside the first reader slot. The long-standing note
+> about "a second counter at 0x24 tracking the frame counter" was reading one
+> reader's cursor. Likewise the "two reader cursors at 0x0C/0x10 moving
+> together ~2 KB apart" were the write head and the tail; the real per-reader
+> cursors are `slot[k]+8`.
 
 ### Reader slot (16 bytes, `slot[k]` at `0x1C + 16*k`)
 
@@ -86,17 +96,17 @@ capacity/reserve figure.
 | +0 | u32 | **pending** — nonzero means "there may be data for you" | ASM |
 | +4 | u32 | **waiting** — reader is parked in `sem_wait(notify[k])` | ASM |
 | +8 | u32 | **cursor** — sequence number of the last record consumed | ASM |
-| +12 | u16 | **filter** — subscription mask; **0 = slot free** | ASM / INF |
+| +12 | u16 | **filter** — subscription mask; **0 = slot free** | ASM |
 | +14 | u16 | padding, always 0 | DATA |
 
 **ASM** — `add r4, r4, #28` then `add r4, r4, r0, lsl #4` at `0x12b94`/`0x12b9c`
 gives `&slot[idx]`; the field offsets come from `ldr r3,[r4]` (+0),
 `str r6,[r4,#4]` (+4), `ldr r0,[r6,#8]` (+8), `ldrh r1,[r6,#12]` (+12).
 
-`slot+12 == 0` meaning "free" is **INF**: it is the only field a reader sets on
-registration that a writer could test, all 14 unused slots read as all-zero
-live, and a slot that was occupied earlier today (`slot[6]`, filter `0x0400`)
-is now fully zeroed — so something does clear slots on release.
+`slot+12 == 0` means "free" — not because anything tests it explicitly, but
+because the writer's only slot predicate is `entry_type & (filter & 0xFF00)`
+(§6), which a zero filter can never satisfy. There is no separate
+registered/unregistered bit anywhere in the structure.
 
 ## 3. Record framing
 
@@ -111,12 +121,17 @@ record starts at `off + 26 + len`, wrapping at 0x1B4000.
 |---|---|---|---|
 | +0 | u32 | payload length | ASM+DATA |
 | +4 | u32 | **sequence number**, +1 per record, ring-wide | ASM+DATA |
-| +8 | u32 | opaque; delivered to the caller as `out+0` | ASM |
-| +12 | u32 | opaque; delivered as `out+4` | ASM |
+| +8 | u32 | **magic** (`0x6a8c….`/`0x6a89….` family) | ASM(rmm) |
+| +12 | u32 | **caller cookie** — `0x01c69010` on chain parts, 0 on plain frames | ASM(rmm) |
 | +16 | u32 | **timestamp**, same clock as header `0x14` | ASM+DATA |
-| +20 | u16 | **type** (see below) | ASM+DATA |
-| +22 | u16 | opaque; delivered as `out+12` | ASM |
-| +24 | u16 | opaque; delivered as `out+20` | ASM |
+| +20 | u16 | **type** (see below); bit `0x20` = "payload has an extras prefix" | ASM+DATA |
+| +22 | u16 | **chain-part sequence** — the caller bumps it between SPS/PPS/IDR | ASM(rmm) |
+| +24 | u16 | caller-supplied; 0 in every capture | ASM(rmm) |
+
+`+0` includes the extras prefix: `rmm` computes `len = payload + fp` where `fp`
+is 6, 5 or 0 selected by a subtype byte, and sets `type |= 0x20` when `fp != 0`
+(`0x5fe60: orr ip, ip, #32`). So the old "`0x0422` SPS#1 has an 8-byte prefix"
+observation is the `0x20` flag, and `26 + len` is always the exact stride.
 
 ### Validation (DATA)
 
@@ -450,7 +465,93 @@ rd_unlock();
 `ring_copy(off, dst, n)` is the wrapping read of `n` bytes at ring offset `off`
 from `base + DATA_OFF`, splitting at `DATA_SZ`.
 
-## 6. Consequences for `fshare2fifo` v2
+## 6. The writer side (`rmm`)
+
+Read out of `rmm.bin`; `fshare_create` @ `0x5f828`, `fshare_open` @ `0x5fabc`,
+`fshare_write` @ `0x5fd14`. A binary-wide scan for the fshare global (`0x19B214`,
+same layout as `tserver`'s `0x240D4`) found exactly 17 references — so this is
+the only ring writer in `rmm`.
+
+### The post predicate (ASM — resolves the central question)
+
+`fshare_write` holds **only `/fshare_write_lock`** (`sem_wait` at `0x5fd60`,
+`sem_post` at `0x5ff18`) and never touches `read_lock` or `hdr[0x00]`. After the
+record is written it walks all 17 slots (`0x5feb4`–`0x5fecc`, stride 16, from
+`base+0x1C` to `base+0x12C`, with the notify array in lockstep):
+
+```c
+for (int i = 0; i < 17; i++) {
+    uint16_t filter = slot[i].filter;
+    if (!(entry_type & (filter & 0xFF00)))   /* 5fed8 bic / 5fedc tst */
+        continue;
+    slot[i].pending = 1;                     /* 5fee8 str — a store, not an increment */
+    if (slot[i].waiting != 0)                /* 5fee4 ldr / 5feec cmp / 5fef0 beq */
+        sem_post(notify[i]);                 /* 5fefc — the only post */
+}
+```
+
+Three things fall out:
+
+- **The writer posts only to slots whose reader is parked.** That is the
+  complete explanation for `semprobe` seeing zero posts, and it composes with
+  the slotwatch result: no stock reader was even consuming, let alone parked.
+- **`filter == 0` is the free marker after all** — not via an explicit test, but
+  because a zero filter can never satisfy the AND. There is no separate
+  registered/unregistered bit anywhere.
+- **The writer applies only the class AND.** The low-nibble subtype test and the
+  cursor freshness test exist solely in the reader (`0x5f7c4` in `rmm`,
+  `0x1247c` in `tserver`). So `pending` is an over-approximation: it means
+  "something in your class arrived", not "something you want". A reader must
+  still scan and may legitimately find nothing.
+
+The handshake is race-free: the writer sets `pending` and reads `waiting` under
+`write_lock`, while the reader checks `pending` under `read_lock` — which, as
+first reader, *is* `write_lock`. The reader publishes `waiting = 1` before
+releasing, so any write that lands after the check necessarily observes it. No
+lost wakeups.
+
+### Create, and what is never initialised (ASM)
+
+`fshare_create` is `shm_open("/fshare_frame_buf", O_CREAT|O_RDWR, 0644)` +
+`ftruncate(fd, 0x1B412C)` + `mmap` + six `sem_open`s, and **stores nothing into
+the mapping** — the header and all 17 slots start as ftruncate's zeros. The two
+locks are created with value **1**, the 17 notify semaphores with value **0**
+(`0x5f900: mov r3, sl` with `sl = 0`).
+
+That is what makes the contamination argument below conclusive rather than
+suggestive: a notify semaphore's word is `0` at creation and `-1` only while a
+reader is parked — yet **all 17 read `-1`, including the 14 slots whose filter
+is 0 and which therefore no reader can ever park on.**
+
+### Overwrite policy: the writer ignores slow readers entirely (ASM)
+
+When `valid + entrysize > 0x1B4000` the writer pops records off the tail
+(`0x5fd9c`–`0x5fde0`), and per pop it updates **only** `hdr[0x04] -= popped` and
+`hdr[0x10] = new tail`. No cursor is bumped, no slot is zeroed, there is no
+"reader too slow" path, and no reader state is even read. A stale cursor is
+simply left stale, and the reader's own freshness test is what sorts it out on
+its next scan. Records larger than `0x1B4000 - 26` are rejected before the lock
+with the `size(%d) > size_max(%d)` error.
+
+### Per-write header maintenance (ASM)
+
+| Field | Update |
+|---|---|
+| 0x04 | `+= 26 + len`, after the pop loop guarantees it fits (`0x5fdec`) |
+| 0x0C | `head = (head + 26 + len) mod 0x1B4000` (`0x5fdf0`–`0x5fe18`) |
+| 0x10 | written **only** in the pop path (`0x5fddc`) |
+| 0x14 | monotonic max of `ts`, non-0x0200 records only (`0x5ff2c`–`0x5ff4c`) |
+| 0x18 | `seq += 1`, skipping 0 on wrap (`0x5fe00`–`0x5fe14`) — every write |
+| 0x08 | monotonic max payload length, class 0x0200 only (`0x5fe98`) |
+| slot | `slot[i].pending = 1` on class match; `+4`/`+8`/`+12` never written |
+
+A decimal/hex trap to watch for when re-reading this: objdump prints load
+offsets in decimal, so the caught-up test's `ldr r2, [r3, #24]` is offset
+**0x18**, not 0x24. `verify_fshare_map.py` confirms it from the other side —
+the last record's `seq` equals `hdr[0x18]` exactly on every snapshot — and
+`0x24` is `slot[0].cursor`.
+
+## 7. Consequences for `fshare2fifo` v2
 
 - **No sampler, no shadow buffer, no tear check, no lap detection, no head
   estimation, no MAX_LAG.** All of it is replaced by `hdr[0x10]`, `hdr[0x04]`
@@ -477,74 +578,91 @@ Indices are hardcoded per consumer, so a squatter can collide. Known: `tserver`
 uses **16**. Live right now, slots **0, 1, 2** are occupied (filters `0x0200`,
 `0x0D00`, `0x0900`) and **3–16 are all-zero**; a `0x0400` registration on slot
 6 existed earlier today and has since been released, so occupancy is dynamic.
+`mp4record`, `oss` and `p2p_tnp` are UPX-packed and their indices are unread —
+this is the one unresolved item that can actually bite v2.
 
-Recommended: pick a high slot away from both ends (**10–14**), and at startup
-refuse to claim it if `slot[K].filter != 0`. Re-check after claiming. Do not
-use 0, 1, 2, or 16.
+Recommended: pick a high slot away from both ends (**10–14**); under `rd_lock`,
+refuse to claim it if `slot[K].filter != 0`, and re-check after claiming. A
+collision is not silently benign — two readers sharing a slot would fight over
+one cursor and each would see the other's records vanish.
 
-### Cross-libc hazard (INF, important)
+Collateral damage is bounded, though: the writer's only per-slot action is
+`pending = 1` plus a conditional post, and it never reads a cursor. So a
+mis-set slot cannot corrupt the ring or wedge `rmm` — it can only starve or
+confuse the reader that owns the slot.
 
-The camera's app is uClibc; our binaries are static musl. The `sem_t` layouts
-and the value encodings of the two libcs are **not** compatible, and these
-semaphores live in shared memory. Evidence that this is not theoretical: the
-`/dev/shm` backing words of the two locks we never waited on are clean
-(`write_lock` and `read_lock` both read `1 0 0 0`), while **all 17 notify
-semaphores, which `semprobe` did `sem_timedwait` on, now read `-1 0 0 0`**.
-musl's `sem_timedwait` does `a_cas(sem->__val, 0, -1)` before blocking and does
-not restore the word on timeout — so that `-1` is residue our own probe left in
-the app's semaphores. Under a uClibc reader that word may read as an enormous
-unsigned count.
+### Cross-libc hazard — and damage we have already done
 
-No harm is currently observable — the stock readers' cursors are advancing
-normally and no process is spinning — and `/dev/shm` is tmpfs, so a reboot
-clears it. But before v2 goes live: confirm the two libcs agree on the on-disk
-`sem_t`, and prefer a hand-rolled futex wait on the semaphore word over
-trusting musl's wrappers. The safe fallback, if they do not agree, is to skip
-`notify[K]` entirely and poll `slot[K].pending` under `rd_lock` on a short
-timer — correctness does not depend on the semaphore, only latency does.
+The camera's app is uClibc; our binaries are static musl. These `sem_t`s live in
+shared memory, so both libcs' encodings have to agree, and there is direct
+evidence they do not.
 
-## 7. What stays unproven
+`rmm` creates the notify semaphores with value **0** and never writes them
+again except via `sem_post`. Their backing word should therefore read `0` at
+rest. Instead **all 17 read `-1 0 0 0`** — while `write_lock` and `read_lock`,
+which none of our probes ever waited on, read a clean `1 0 0 0`. musl's
+`sem_timedwait` does `a_cas(sem->__val, 0, -1)` before blocking and does not
+restore the word on timeout, and `semprobe` timed-waited all 17.
 
-1. **`hdr[0x08]`** — read by no code in `tserver`; not a ring offset; a
-   slowly-varying byte magnitude. Probably a capacity/reserve figure related to
-   `try_adjust_buf` / `size_max`.
-2. **The writer's post predicate** — *which* notify semaphores `rmm` posts and
-   when. The reader side proves `waiting` is published for the writer's
-   benefit, which makes "post only to slots with `waiting == 1`" the natural
-   reading, but that is **HYP** until read out of `rmm`. Whether the writer
-   also applies the filter before posting, and whether it sets `pending` to 1
-   or to a count, is likewise unproven. Note this cannot be settled by
-   observation on an idle camera — see the slotwatch result above.
-3. **`slot+12 == 0` as the free/occupied marker** — INF, not ASM. No stock code
-   *observed so far* tests it; the inference rests on it being the only
-   candidate field and on slots being observed to zero out on release.
-4. **Overwrite policy** — what the writer does to a reader whose cursor falls
-   off the tail. The reader side degrades gracefully by construction, but
-   whether the writer actively bumps a slow cursor or drops the reader is
-   unknown.
-5. **Record header `+8`, `+12`, `+22`, `+24`** — faithfully delivered to the
-   caller, never interpreted by the fshare layer. `+22`/`+24` are plausibly
-   width/height or a frame index (**HYP**).
-6. **Class `0x0200`** — a live reader subscribes to it (slot 0, and its cursor
-   advances quickly) yet no record of that class appears in any snapshot.
-   Unexplained.
-7. **Timestamp units** for `+16` / `hdr[0x14]`, and therefore the units of
+The clincher is that 14 of those 17 slots have `filter == 0`, so by §6 no
+reader can ever park on them and no legitimate `-1` is possible there. **That
+`-1` is residue our own probe left in the app's semaphores.** Under uClibc the
+word may read as an enormous unsigned count, which would make `sem_wait` return
+instantly and turn a parked reader into a spinner.
+
+No harm is currently observable — nothing is spinning, and `top` is dominated
+by our own `fshare2fifo` — and `/dev/shm` is tmpfs, so **a reboot clears it**.
+Before v2 depends on these semaphores: confirm the two libcs agree on the
+on-disk `sem_t`, and prefer a hand-rolled futex wait on the raw word over
+musl's wrappers. The safe fallback is to skip `notify[K]` entirely and poll
+`slot[K].pending` on a short timer — correctness does not depend on the
+semaphore, only latency does.
+
+## 8. What stays unproven
+
+The writer disassembly closed the big ones — the post predicate, `hdr[0x08]`,
+the overwrite policy, and most of the record header. What is left:
+
+1. **Class `0x0200`.** `rmm` clearly writes such records — they are the only
+   thing that advances `hdr[0x08]`, and `hdr[0x08]` does advance — and
+   `slot[0]` subscribes to exactly that class. Yet **no record of class 0x0200
+   appears in any snapshot.** They are presumably rare and large (`hdr[0x08]`
+   is now 276961 bytes, larger than any video record) — a stills/JPEG or
+   event-blob channel would fit. Not captured, not identified.
+2. **Timestamp units** for `+16` / `hdr[0x14]`, and therefore the units of
    `fshare_register`'s `start_age` argument.
-8. **Slot ownership per process** — `mp4record`, `oss` and `p2p_tnp` map the
-   ring but are UPX-packed, so their indices were not read out. `rmm` (10
-   threads) may also register internal readers.
+3. **Record header `+24`** — caller-supplied, 0 in every capture, purpose
+   unknown. (`+8` magic, `+12` cookie and `+22` chain-sequence are now read.)
+4. **Who releases a slot.** Slots are observed to go from occupied to all-zero
+   (`slot[6]`, filter `0x0400`, did so today), but neither `tserver` nor
+   `rmm`'s writer contains the code that clears one. Presumably a
+   `fshare_unregister` in the reader library that `tserver` does not call.
+5. **`sem_t` compatibility between uClibc and musl** — see the hazard above.
+   Assumed incompatible on the evidence; not confirmed by reading uClibc.
+6. **Slot ownership per process.** `mp4record`, `oss` and `p2p_tnp` map the
+   ring but are UPX-packed, so their hardcoded indices were not read out.
+   `rmm` also has two internal readers of its own (`0x5fff4`, `0x601f0`) which
+   poll `pending` and never park. This is the one open item that directly
+   affects v2 — see the slot-choice note.
+7. **`fshare_open`'s callers in `rmm`** — no static `bl` reaches `0x5fabc`, so
+   it is presumably dispatched through a function-pointer table.
 
-## 8. Reproducing this
+## 9. Reproducing this
 
 ```bash
-# disassembly
+# disassembly (tserver = the reader, rmm = the writer)
 arm-linux-musleabi-objdump -d analysis/tserver.bin > /tmp/tserver.dis
+arm-linux-musleabi-objdump -d analysis/rmm.bin     > /tmp/rmm.dis
 
 # framing validation against snapshots
 python3 analysis/verify_fshare_map.py ring_n.bin ring_l.bin
 
 # live header + slot table, read-only, no tools needed on the camera
 ssh ... "dd if=/dev/shm/fshare_frame_buf bs=1 count=300 2>/dev/null | od -A d -t u4"
+
+# live slot activity, read-only (build with tools/build-armv6.sh's toolchain)
+arm-linux-musleabi-gcc -O2 -static -no-pie -march=armv6 -mfloat-abi=soft \
+    -o slotwatch analysis/slotwatch.c
 ```
 
 ARM A32 PC-relative reminder for checking the citations: for `ldr rX,[pc,#N]`
