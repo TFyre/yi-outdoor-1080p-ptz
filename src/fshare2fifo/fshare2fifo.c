@@ -688,6 +688,26 @@ static void reader_loop(void)
                 if (h.seq == newest)
                     break;             /* the newest record may be mid-copy */
                 if (entry_wanted(slot_cursor, FILTER_HIRES, &h)) {
+                    /* Live-edge jump: when the walk's first match is
+                     * far ahead of the cursor (a client stall, a slow
+                     * drain), serving the backlog would trail the
+                     * live edge by the stall's whole duration - the
+                     * backlog can never be closed. tserver's
+                     * streaming loop uses read_latest for the same
+                     * reason: drop it and jump. The chain gate
+                     * re-arms at the next chain (~2.5 s). */
+                    if (h.seq - (slot_cursor + 1u) > 100u) {
+                        if (f2f_trace())
+                            fprintf(stderr,
+                                    "jump: cursor %u -> %u (%u skipped)\n",
+                                    slot_cursor, h.seq,
+                                    h.seq - (slot_cursor + 1u));
+                        slot_cursor = h.seq - 1;
+                        continue;      /* re-scan from the tail: the
+                                          chain records between the
+                                          cursor and here are skipped,
+                                          the gate re-arms below */
+                    }
                     if (h.len <= MAXPAY) {
                         ring_copy((uint32_t)(off + 26), payload, h.len);
                         cur_len = h.len;
@@ -703,8 +723,21 @@ static void reader_loop(void)
                 off = (off + 26 + h.len) % DATA_SZ;
                 left -= 26 + h.len;
             }
-            if (!got)
+            if (!got) {
+                /* era reset: the writer's seq dropped (a new counter
+                 * era, the app resets it mid-uptime) - the cursor
+                 * belongs to the dead epoch and no record will ever
+                 * match it again. Re-anchor at the newest seq. */
+                if (newest < slot_cursor &&
+                    slot_cursor - newest > 10000u) {
+                    slot_cursor = newest;
+                    slot_wr_u32(SLOT_OFF(slot_k) + 8, newest);
+                    if (f2f_trace())
+                        fprintf(stderr,
+                                "era: cursor re-anchored to %u\n", newest);
+                }
                 slot_wr_u32(SLOT_OFF(slot_k), 0);  /* nothing for us now */
+            }
         }
 
         if (f2f_agelog()) {
