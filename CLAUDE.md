@@ -133,39 +133,35 @@ sprint blocks and looped forever (sprint → block ≥1.1 s → re-sync →
 sprint). Per-second diagnostics:
 `F2F_AGELOG=1` logs pos/head/dist/emission/block stats.
 
-**The slot protocol (the ring's real contract, discovered 2026-08-25,
-commit 57e4e2d, refined by the slotprobe/endprobe/scanprobe/cap-timeline
-live maps)**: the app coordinates `fshare_frame_buf` with named POSIX
-semaphores in /dev/shm: `sem.fshare_write_lock` + `sem.fshare_read_lock`
-(both value 1) and 17 per-slot notifies `sem.fshare_read_notify_0..16`.
-Measured live (all values raw-read from the backing files):
-- 0x0C = a full-ring cursor advancing per WRITE CHUNK (~28/s in the
-  current era; the dominant step is 196-197 B at 7.1/s = record-framed
-  audio: 24-byte header + ~172-byte AAC) and LEADING the actual byte
-  writes by ~6-11 KB (a reservation frontier; the diff-based write
-  head lags it — reading to 0x0C emits stale pre-lap bytes).
-- 0x04 advances in EXACT lockstep with 0x0C (every delta matches,
-  audio-paced), confined to a 215 KB band at the file top
-  [1.57M, 1.786M], with a piecewise-constant offset 04-0c that changes
-  every ~2-3 s. Role unconfirmed (raw-frame ring? mirror?).
-- 0x10 freezes for seconds then leaps (a slow consumer cursor).
-- The notify words are futex wait-queue markers: slot 0 = -1, slot 1 =
-  0xFDEA64D4, slot 2 = 0xFFF569EA (kernel wait-queue addresses) —
-  the app's readers (tserver? mp4record?) are PARKED on slots 1-2;
-  posts are consumed in microseconds, which is why every probe sees
-  zero. Not broadcast per chunk; the trigger is unknown.
-- The current era is raw Annex-B mode: zero valid c0 checkpoints and
-  zero record markers in a full-ring scan; the 0x0C advances are NOT
-  record- or frame-aligned (0/828 regions started on a record header),
-  which REJECTED the "emit [E_prev, E_new) regions" v2 design.
-fshare2fifo uses none of the protocol — a blind diff-walk reader whose
-diff head is nonetheless the correct byte boundary. The reader-side
-protocol is being reverse-engineered from the tserver disassembly
-into `analysis/fshare-protocol.md`; the open questions for it: what
-is 0x04, what triggers a notify post, and what the 0xffffffff /
-wait-queue futex words encode. Probes:
-`src/ring-capture/{semprobe,slotprobe,endprobe,scanprobe,cap-timeline}.c`;
-artifacts: `analysis/timeline-20260825.txt` + `ring-cap-20260825.bin`.
+**The fshare protocol (fully reverse-engineered 2026-08-25/26, commits
+57e4e2d/b65159d — the authoritative spec is `analysis/fshare-protocol.md`)**: the
+ring is a sequence-numbered RECORD LOG, not a byte stream. The mapping is a
+300-byte header + a 0x1B4000-byte ring: 0x00 active-reader count, 0x04 valid
+bytes, 0x0C head = (tail + valid) mod ring (derived), 0x10 tail, 0x14 newest
+record ts, 0x18 newest seq, then `reader_slot[17]` (stride 16: +0 pending,
++4 waiting, +8 cursor, +12 filter). Records: 26-byte header (len@+0, seq@+4,
+magic@+8 — the two-byte shift that made the old +6 scans see "zero records"
+and invent the raw-Annex-B era — ts@+16, type@+20, chain-part@+22) + payload.
+Types: 0x0100 audio, 0x0400 hi-res frame, 0x0800 low-res, chain parts
+0x0422/0x0401/0x0404 (hi) and 0x08xx (lo). The 0x0401 record carries the
+WHOLE GOP head (SPS+PPS+~20 zeros+IDR) in one payload; SPS/PPS NALs need
+stop-bit trims (the app glues metadata after the rbsp_stop). The writer
+publishes seq/valid/head BEFORE copying the record bytes, one record at a
+time; it posts a slot's notify only when that slot's reader is parked.
+
+**fshare2fifo is v2 (commit d34df8c)**: a registered reader (slot 10, filter
+0x0400), polling `pending`, walking records by seq, emitting only the hi-res
+stream. **LOCK-FREE — NEVER take the app's semaphores**: hand-rolled futex
+interop against the uClibc-layout sem words wedged the camera's write lock
+twice (the app's wake-then-inc post order vs ours corrupts the {0,1}
+invariant), leaving the lock held by nobody and stalling rmm's whole
+pipeline (H264_CB stuck in `down`; a reboot is the recovery). The lock-free
+walk is correct by the doc's own analysis: records with seq < hdr[0x18] are
+complete by construction; magic/stride validation stops the walk on anything
+torn; slot writes race benignly (the writer never reads cursors). The whole
+v1 machinery (diff sampler, shadows, tear checks, head estimation, MAX_LAG,
+re-joins, start-code ring scanning) is deleted — ~950 lines vs the walk's
+~3000.
 
 **Ring format (reverse-engineered from live captures, commit 1677010)**:
 the ring carries TWO interleaved H.264 streams — the target 1920×1088
