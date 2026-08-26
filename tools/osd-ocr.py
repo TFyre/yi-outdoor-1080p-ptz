@@ -17,6 +17,9 @@ import subprocess, sys, re, os, tempfile, argparse
 # The OSD prints the date immediately before the time
 # ("2026082515:45:25"), so the time has no word boundary on the left.
 TS_RE = re.compile(r'(\d{1,2}:\d{2}:\d{2})')
+# Some eras render the colons too faint for psm 7 + the whitelist;
+# the digit run still parses: YYYYMMDD + HHMMSS.
+DIGITS_RE = re.compile(r'(\d{8})(\d{2})(\d{2})(\d{2})')
 
 def ocr_box(img_path, box):
     """OCR one cropped box; return the first HH:MM:SS found. The RAW
@@ -41,6 +44,16 @@ def ocr_box(img_path, box):
             m = TS_RE.search(out)
             if m:
                 return m.group(1)
+        # psm 6 fallback: the colons can render too faint for psm 7;
+        # parse the YYYYMMDD + HHMMSS digit run instead.
+        im.save(tmp)
+        out = subprocess.run(
+            ['tesseract', tmp, 'stdout', '--psm', '6'],
+            capture_output=True, text=True, timeout=10).stdout
+        digits = ''.join(ch for ch in out if ch.isdigit())
+        m = DIGITS_RE.search(digits)
+        if m:
+            return '%s:%s:%s' % (m.group(2), m.group(3), m.group(4))
     finally:
         os.unlink(tmp)
     return None

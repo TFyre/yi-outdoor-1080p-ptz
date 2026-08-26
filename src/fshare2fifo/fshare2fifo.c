@@ -81,6 +81,7 @@
 static volatile uint8_t *buf;      /* mmap of the shared buffer */
 static size_t buf_size;
 static int slot_k = -1;            /* our reader slot */
+static const char *g_fifo_name = DEFAULT_FIFO;
 static uint32_t slot_cursor;       /* mirrored slot[K].cursor */
 static FILE *out;                  /* file output (-o FILE) */
 static int out_fd = -1;            /* fifo output, non-blocking */
@@ -159,6 +160,15 @@ typedef struct {
     uint16_t type, chain, extra;            /* +20..+24 (26 bytes total) */
 } rec_hdr;
 
+/* The record magic's high 16 bits are a family, not a constant: the
+ * observed prefixes are 0x6a8c, 0x6a89, 0x6a8a (boot era) and 0x6a8f
+ * (post-reboot) - only 0x6a8x is fixed. */
+static int magic_ok(uint32_t m)
+{
+    unsigned hi = m >> 16;
+    return hi >= 0x6a80 && hi <= 0x6a8f;
+}
+
 /* Is this record wanted by a slot with this cursor and filter? The
  * writer only applies the class AND (that is what sets pending); the
  * subtype and the cursor freshness tests live here, in the reader. */
@@ -187,8 +197,12 @@ static void *fifo_purger_thread(void *arg)
     int fd = open(fifo_name, O_RDONLY);
     uint8_t drain[65536];
 
-    if (fd < 0)
+    if (fd < 0) {
+        fprintf(stderr, "purger: open %s failed (%s)\n",
+                fifo_name, strerror(errno));
         return NULL;
+    }
+    fprintf(stderr, "purger: holding %s read end\n", fifo_name);
     fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBLOCK);
     while (1) {
         int n = 0;
@@ -241,7 +255,24 @@ static int sps_read_se(const uint8_t *s, size_t slen, size_t *pos)
          if (f2f_trace()) fprintf(stderr, "  %s = %u (pos %zu)\n", \
                                   label, (unsigned)(var), pos); } while (0)
 
-static int parse_sps_dims(const uint8_t *d, size_t len, unsigned *w, unsigned *h)
+/* ---- SPS synthesis (replaces the stop-bit trim) ----
+ * The era's SPS NAL carries the app's glued metadata after the rbsp
+ * stop; the stop-bit heuristics proved unreliable (they landed inside
+ * the junk and the decoder parsed it as a VUI: "Overread VUI by 8
+ * bits"). Instead, REBUILD a canonical SPS from the parsed fields:
+ * everything the slices depend on (log2_max_frame_num, pic_order_cnt,
+ * max_num_ref_frames, the dims, frame_mbs_only) is taken from the
+ * real SPS; the optional parts (cropping, VUI) are omitted. */
+struct sps_info {
+    unsigned profile, constraint, level, sps_id;
+    unsigned log2frm, poc_type, poc_lsb, max_ref;
+    unsigned w, h;
+    int fmbo, mb_adaptive, direct8x8, crop_flag;
+    unsigned crop[4];
+    int ok;
+};
+
+static void parse_sps_full(const uint8_t *d, size_t len, struct sps_info *si)
 {
     uint8_t stripped[NAL_BUF_MAX];
     size_t slen = 0;
@@ -249,8 +280,9 @@ static int parse_sps_dims(const uint8_t *d, size_t len, unsigned *w, unsigned *h
     int profile;
     unsigned val;
 
+    memset(si, 0, sizeof(*si));
     if (len < 4 || len > NAL_BUF_MAX)
-        return 0;
+        return;
     for (i = 0; i < len && slen < sizeof(stripped); i++) {
         if (slen >= 2 && stripped[slen - 1] == 0 && stripped[slen - 2] == 0 &&
             d[i] == 3)
@@ -258,11 +290,16 @@ static int parse_sps_dims(const uint8_t *d, size_t len, unsigned *w, unsigned *h
         stripped[slen++] = d[i];
     }
     if (slen < 4)
-        return 0;
+        return;
 
     profile = stripped[1];
     pos = 32;                        /* nal header + profile/constraints/level */
+    si->profile = (unsigned)stripped[0 + 0];   /* the NAL header byte */
+    si->profile = (unsigned)profile;
+    si->constraint = (unsigned)stripped[2];
+    si->level = (unsigned)stripped[3];
     SPS_UE("seq_parameter_set_id", val);
+    si->sps_id = val;
     if (profile == 100 || profile == 110 || profile == 122 || profile == 244 ||
         profile == 44 || profile == 83 || profile == 86 || profile == 118 ||
         profile == 128 || profile == 138 || profile == 139 || profile == 134 ||
@@ -289,9 +326,12 @@ static int parse_sps_dims(const uint8_t *d, size_t len, unsigned *w, unsigned *h
         }
     }
     SPS_UE("log2_max_frame_num_minus4", val);
+    si->log2frm = val;
     SPS_UE("pic_order_cnt_type", val);
+    si->poc_type = val;
     if (val == 0) {
         SPS_UE("log2_max_pic_order_cnt_lsb_minus4", val);
+        si->poc_lsb = val;
     } else if (val == 1) {
         (void)sps_read_bit(stripped, slen, &pos);
         SPS_UE("offset_for_non_ref_pic", val);
@@ -299,283 +339,96 @@ static int parse_sps_dims(const uint8_t *d, size_t len, unsigned *w, unsigned *h
         SPS_UE("num_ref_frames_in_poc_cycle", val);
         for (i = 0; i < val && i < 255; i++)
             (void)sps_read_ue(stripped, slen, &pos);
+        si->poc_type = 9;              /* unsupported: no synthesis */
     }
     SPS_UE("max_num_ref_frames", val);
-    (void)sps_read_bit(stripped, slen, &pos);
+    si->max_ref = val;
+    (void)sps_read_bit(stripped, slen, &pos);   /* gaps_in_frame_num */
     SPS_UE("pic_width_in_mbs_minus1", val);
     SPS_UE("pic_height_in_map_units_minus1", i);
     if (val == 0xFFFF || i == 0xFFFF || val > 300 || i > 300)
-        return 0;
-    *w = (val + 1) * 16;
-    *h = (i + 1) * 16;
-    if (sps_read_bit(stripped, slen, &pos) == 0)
-        *h *= 2;
-    return 1;
+        return;
+    si->w = (val + 1) * 16;
+    si->h = (i + 1) * 16;
+    si->fmbo = sps_read_bit(stripped, slen, &pos);
+    if (!si->fmbo) {
+        si->mb_adaptive = sps_read_bit(stripped, slen, &pos);
+        si->h *= 2;
+    }
+    si->direct8x8 = sps_read_bit(stripped, slen, &pos);
+    si->crop_flag = sps_read_bit(stripped, slen, &pos);
+    if (si->crop_flag) {
+        si->crop[0] = sps_read_ue(stripped, slen, &pos);
+        si->crop[1] = sps_read_ue(stripped, slen, &pos);
+        si->crop[2] = sps_read_ue(stripped, slen, &pos);
+        si->crop[3] = sps_read_ue(stripped, slen, &pos);
+        if (si->crop[0] == 0xFFFF || si->crop[1] == 0xFFFF ||
+            si->crop[2] == 0xFFFF || si->crop[3] == 0xFFFF)
+            return;
+    }
+    /* the VUI flag and its contents are intentionally NOT parsed: the
+     * synthesis drops the VUI entirely */
+    si->ok = 1;
 }
 
-/* The SPS's true body length: like the PPS, the app glues metadata
- * after the rbsp_stop, and the decoder parses that junk as the VUI
- * ("Overread VUI by 8 bits", then garbage pps_ids). Walk the WHOLE
- * SPS grammar - dims, cropping, the VUI with its HRD sub-grammar -
- * then the stop bit is the first 1 followed by only zeros to the
- * byte boundary. Returns the body length, or 0 if the parse fails
- * (callers then keep the untrimmed emission). */
-static size_t parse_sps_len(const uint8_t *d, size_t len)
+static void sps_wbits(uint8_t *out, size_t *pos, uint32_t v, unsigned n)
 {
-    uint8_t stripped[NAL_BUF_MAX];
-    size_t slen = 0;
-    size_t i, pos;
-    unsigned v, chroma = 1;
-    int profile, fmbo;
-
-    if (len < 4 || len > NAL_BUF_MAX)
-        return 0;
-    for (i = 0; i < len && slen < sizeof(stripped); i++) {
-        if (slen >= 2 && stripped[slen - 1] == 0 && stripped[slen - 2] == 0 &&
-            d[i] == 3)
-            continue;
-        stripped[slen++] = d[i];
+    while (n--) {
+        if (v & (1u << n))
+            out[*pos / 8] |= (uint8_t)(1u << (7 - (*pos % 8)));
+        (*pos)++;
     }
-    if (slen < 4)
-        return 0;
-
-    profile = stripped[1];
-    pos = 32;                        /* nal header + profile/constraints/level */
-    SPS_UE("sps: seq_parameter_set_id", v);
-    if (profile == 100 || profile == 110 || profile == 122 || profile == 244 ||
-        profile == 44 || profile == 83 || profile == 86 || profile == 118 ||
-        profile == 128 || profile == 138 || profile == 139 || profile == 134 ||
-        profile == 135) {
-        SPS_UE("sps: chroma_format_idc", chroma);
-        if (chroma == 3)
-            (void)sps_read_bit(stripped, slen, &pos);
-        SPS_UE("sps: bit_depth_luma_minus8", v);
-        SPS_UE("sps: bit_depth_chroma_minus8", v);
-        (void)sps_read_bit(stripped, slen, &pos); /* qpprime bypass */
-        if (sps_read_bit(stripped, slen, &pos)) { /* scaling matrix present */
-            unsigned m;
-            for (m = 0; m < (chroma != 3 ? 8 : 12); m++) {
-                if (sps_read_bit(stripped, slen, &pos)) { /* list present */
-                    unsigned n = (m < 6) ? 16 : 64;
-                    unsigned last = 8, nxt = 8;
-                    for (i = 0; i < n; i++) {
-                        if (nxt != 0) {
-                            int ds = sps_read_se(stripped, slen, &pos);
-                            nxt = (unsigned)((int)last + ds + 256) % 256;
-                        }
-                        if (nxt != 0)
-                            last = nxt;
-                    }
-                }
-            }
-        }
-    }
-    SPS_UE("sps: log2_max_frame_num_minus4", v);
-    SPS_UE("sps: pic_order_cnt_type", v);
-    if (v == 0) {
-        SPS_UE("sps: log2_max_pic_order_cnt_lsb_minus4", v);
-    } else if (v == 1) {
-        (void)sps_read_bit(stripped, slen, &pos);
-        (void)sps_read_se(stripped, slen, &pos);
-        (void)sps_read_se(stripped, slen, &pos);
-        SPS_UE("sps: num_ref_frames_in_poc_cycle", v);
-        for (i = 0; i < v && i < 255; i++)
-            (void)sps_read_se(stripped, slen, &pos);
-    }
-    SPS_UE("sps: max_num_ref_frames", v);
-    (void)sps_read_bit(stripped, slen, &pos); /* gaps flag */
-    SPS_UE("sps: pic_width_in_mbs_minus1", v);
-    SPS_UE("sps: pic_height_in_map_units_minus1", v);
-    fmbo = sps_read_bit(stripped, slen, &pos); /* frame_mbs_only */
-    if (!fmbo)
-        (void)sps_read_bit(stripped, slen, &pos); /* mb_adaptive */
-    (void)sps_read_bit(stripped, slen, &pos); /* direct_8x8 */
-    if (sps_read_bit(stripped, slen, &pos)) {  /* frame_cropping_flag */
-        (void)sps_read_ue(stripped, slen, &pos);
-        (void)sps_read_ue(stripped, slen, &pos);
-        (void)sps_read_ue(stripped, slen, &pos);
-        (void)sps_read_ue(stripped, slen, &pos);
-    }
-    if (sps_read_bit(stripped, slen, &pos)) {  /* vui_parameters_present */
-        unsigned hrd = 0;
-        if (sps_read_bit(stripped, slen, &pos)) { /* aspect_ratio_info */
-            v = 0;
-            {
-                unsigned k;
-                for (k = 0; k < 8; k++)
-                    v = (v << 1) | (unsigned)sps_read_bit(stripped, slen, &pos);
-            }
-            if (v == 255) {
-                unsigned k;
-                for (k = 0; k < 16; k++)
-                    (void)sps_read_bit(stripped, slen, &pos);
-                for (k = 0; k < 16; k++)
-                    (void)sps_read_bit(stripped, slen, &pos);
-            }
-        }
-        if (sps_read_bit(stripped, slen, &pos)) /* overscan_info */
-            (void)sps_read_bit(stripped, slen, &pos);
-        if (sps_read_bit(stripped, slen, &pos)) { /* video_signal_type */
-            (void)sps_read_bit(stripped, slen, &pos);
-            (void)sps_read_bit(stripped, slen, &pos);
-            (void)sps_read_bit(stripped, slen, &pos);
-            if (sps_read_bit(stripped, slen, &pos)) { /* colour_description */
-                unsigned k;
-                for (k = 0; k < 24; k++)
-                    (void)sps_read_bit(stripped, slen, &pos);
-            }
-        }
-        if (sps_read_bit(stripped, slen, &pos)) { /* chroma_loc_info */
-            (void)sps_read_ue(stripped, slen, &pos);
-            (void)sps_read_ue(stripped, slen, &pos);
-        }
-        if (sps_read_bit(stripped, slen, &pos)) { /* timing_info */
-            unsigned k;
-            for (k = 0; k < 32; k++)
-                (void)sps_read_bit(stripped, slen, &pos);
-            for (k = 0; k < 32; k++)
-                (void)sps_read_bit(stripped, slen, &pos);
-            (void)sps_read_bit(stripped, slen, &pos);
-        }
-        if (sps_read_bit(stripped, slen, &pos)) { /* nal_hrd_parameters */
-            unsigned cpb, s;
-            SPS_UE("sps: hrd cpb_cnt_minus1", cpb);
-            for (i = 0; i < 4; i++)
-                (void)sps_read_bit(stripped, slen, &pos);
-            for (i = 0; i < 4; i++)
-                (void)sps_read_bit(stripped, slen, &pos);
-            for (s = 0; s <= cpb && s < 32; s++) {
-                (void)sps_read_ue(stripped, slen, &pos);
-                (void)sps_read_ue(stripped, slen, &pos);
-                (void)sps_read_bit(stripped, slen, &pos);
-            }
-            for (i = 0; i < 20; i++)
-                (void)sps_read_bit(stripped, slen, &pos);
-            hrd = 1;
-        }
-        if (sps_read_bit(stripped, slen, &pos)) { /* vcl_hrd_parameters */
-            unsigned cpb, s;
-            SPS_UE("sps: vcl hrd cpb_cnt_minus1", cpb);
-            for (i = 0; i < 4; i++)
-                (void)sps_read_bit(stripped, slen, &pos);
-            for (i = 0; i < 4; i++)
-                (void)sps_read_bit(stripped, slen, &pos);
-            for (s = 0; s <= cpb && s < 32; s++) {
-                (void)sps_read_ue(stripped, slen, &pos);
-                (void)sps_read_ue(stripped, slen, &pos);
-                (void)sps_read_bit(stripped, slen, &pos);
-            }
-            for (i = 0; i < 20; i++)
-                (void)sps_read_bit(stripped, slen, &pos);
-            hrd = 1;
-        }
-        if (hrd)
-            (void)sps_read_bit(stripped, slen, &pos); /* low_delay_hrd */
-        (void)sps_read_bit(stripped, slen, &pos); /* pic_struct_present */
-        if (sps_read_bit(stripped, slen, &pos)) {  /* bitstream_restriction */
-            (void)sps_read_bit(stripped, slen, &pos);
-            (void)sps_read_ue(stripped, slen, &pos);
-            (void)sps_read_ue(stripped, slen, &pos);
-            (void)sps_read_ue(stripped, slen, &pos);
-            (void)sps_read_ue(stripped, slen, &pos);
-            (void)sps_read_ue(stripped, slen, &pos);
-            (void)sps_read_ue(stripped, slen, &pos);
-        }
-    }
-    /* the rbsp stop: the next 1 bit, followed by only zeros to the
-     * byte boundary (bytes beyond are the glued metadata) */
-    {
-        size_t probe = pos;
-        int one = -1;
-        while (probe < slen * 8) {
-            if (sps_read_bit(stripped, slen, &probe) == 1) {
-                one = (int)probe - 1;
-                break;
-            }
-        }
-        if (one >= 0) {
-            size_t after = (size_t)one + 1;
-            size_t byte_end = ((size_t)one / 8 + 1) * 8;
-            int all_zero = 1;
-            while (after < byte_end && after < slen * 8) {
-                if (sps_read_bit(stripped, slen, &after) != 0) {
-                    all_zero = 0;
-                    break;
-                }
-            }
-            if (!all_zero)
-                return 0;              /* a real extension follows */
-            return ((size_t)one + 7) / 8;
-        }
-    }
-    return 0;
 }
 
-/* The PPS's true body length: the app may glue metadata after the
- * rbsp_stop; the decoder parses that junk as PPS syntax and dies. The
- * grammar is short; returns the body length or 0 to keep the whole. */
-static size_t parse_pps_len(const uint8_t *d, size_t len)
+static void sps_wue(uint8_t *out, size_t *pos, uint32_t v)
 {
-    uint8_t stripped[NAL_BUF_MAX];
-    size_t slen = 0;
-    size_t i, pos;
-    unsigned v;
-
-    if (len < 2 || len > NAL_BUF_MAX)
-        return 0;
-    for (i = 0; i < len && slen < sizeof(stripped); i++) {
-        if (slen >= 2 && stripped[slen - 1] == 0 && stripped[slen - 2] == 0 &&
-            d[i] == 3)
-            continue;
-        stripped[slen++] = d[i];
+    unsigned n = 0;
+    uint32_t t = v + 1;
+    while (t > 1) {
+        t >>= 1;
+        n++;
     }
-    if (slen < 2)
-        return 0;
+    sps_wbits(out, pos, 0, n);        /* n leading zeros */
+    sps_wbits(out, pos, v + 1, n + 1);
+}
 
+/* Build the canonical SPS NAL (header byte included). Returns the
+ * byte length. */
+static size_t build_sps(uint8_t *out, const struct sps_info *si)
+{
+    size_t pos = 0;
+
+    memset(out, 0, NAL_BUF_MAX);
+    out[0] = 0x67;
     pos = 8;
-    SPS_UE("pps: pic_parameter_set_id", v);
-    SPS_UE("pps: seq_parameter_set_id", v);
-    (void)sps_read_bit(stripped, slen, &pos);
-    (void)sps_read_bit(stripped, slen, &pos);
-    SPS_UE("pps: num_slice_groups_minus1", v);
-    if (v > 0)
-        return 0;
-    SPS_UE("pps: num_ref_idx_l0_default_active_minus1", v);
-    SPS_UE("pps: num_ref_idx_l1_default_active_minus1", v);
-    (void)sps_read_bit(stripped, slen, &pos);
-    (void)sps_read_bit(stripped, slen, &pos);
-    (void)sps_read_bit(stripped, slen, &pos);
-    (void)sps_read_se(stripped, slen, &pos);
-    (void)sps_read_se(stripped, slen, &pos);
-    (void)sps_read_se(stripped, slen, &pos);
-    (void)sps_read_bit(stripped, slen, &pos);
-    (void)sps_read_bit(stripped, slen, &pos);
-    (void)sps_read_bit(stripped, slen, &pos);
-    {
-        size_t probe = pos;
-        int one = -1;
-        while (probe < slen * 8) {
-            if (sps_read_bit(stripped, slen, &probe) == 1) {
-                one = (int)probe - 1;
-                break;
-            }
-        }
-        if (one >= 0) {
-            size_t after = (size_t)one + 1;
-            size_t byte_end = ((size_t)one / 8 + 1) * 8;
-            int all_zero = 1;
-            while (after < byte_end && after < slen * 8) {
-                if (sps_read_bit(stripped, slen, &after) != 0) {
-                    all_zero = 0;
-                    break;
-                }
-            }
-            if (!all_zero)
-                return 0;              /* a real extension follows */
-            return ((size_t)one + 7) / 8;   /* stop bit position -> bytes */
-        }
+    sps_wbits(out, &pos, si->profile, 8);
+    sps_wbits(out, &pos, si->constraint, 8);
+    sps_wbits(out, &pos, si->level, 8);
+    sps_wue(out, &pos, si->sps_id);
+    sps_wue(out, &pos, si->log2frm);
+    sps_wue(out, &pos, si->poc_type);
+    if (si->poc_type == 0)
+        sps_wue(out, &pos, si->poc_lsb);
+    sps_wue(out, &pos, si->max_ref);
+    sps_wbits(out, &pos, 0, 1);        /* gaps_in_frame_num */
+    sps_wue(out, &pos, si->w / 16 - 1);
+    sps_wue(out, &pos, (si->fmbo ? si->h : si->h / 2) / 16 - 1);
+    sps_wbits(out, &pos, (unsigned)si->fmbo, 1);
+    if (!si->fmbo)
+        sps_wbits(out, &pos, (unsigned)si->mb_adaptive, 1);
+    sps_wbits(out, &pos, (unsigned)si->direct8x8, 1);
+    sps_wbits(out, &pos, (unsigned)si->crop_flag, 1);
+    if (si->crop_flag) {
+        sps_wue(out, &pos, si->crop[0]);
+        sps_wue(out, &pos, si->crop[1]);
+        sps_wue(out, &pos, si->crop[2]);
+        sps_wue(out, &pos, si->crop[3]);
     }
-    return 0;
+    sps_wbits(out, &pos, 0, 1);        /* no VUI */
+    sps_wbits(out, &pos, 1, 1);        /* rbsp stop */
+    while (pos % 8)
+        sps_wbits(out, &pos, 0, 1);    /* trailing zeros */
+    return pos / 8;
 }
 
 /* ---- fifo writes ---- */
@@ -662,32 +515,82 @@ static int emit_record(const uint8_t *p, uint32_t len, uint16_t type)
 
         /* chain gate by NAL type */
         if (nt == 7) {                 /* SPS: opens the stage */
-            unsigned w = 0, h = 0;
-            size_t tl = parse_sps_len(p + s + 4, (size_t)(e - s - 4));
-            if (parse_sps_dims(p + s + 4, e - s - 4, &w, &h)) {
-                if ((uint64_t)w * h > (uint64_t)target_w * target_h) {
-                    target_w = w;
-                    target_h = h;
+            struct sps_info si;
+            uint8_t spsbuf[NAL_BUF_MAX];
+            size_t sl;
+
+            parse_sps_full(p + s + 4, (size_t)(e - s - 4), &si);
+            if (si.ok && si.poc_type == 0) {
+                sl = build_sps(spsbuf, &si);
+                if ((uint64_t)si.w * si.h >
+                    (uint64_t)target_w * target_h) {
+                    target_w = si.w;
+                    target_h = si.h;
                 }
+                stage = 1;
+                if (f2f_trace())
+                    fprintf(stderr,
+                            "rec: type=0x%04x nt=%d synth=%zu (%ux%u "
+                            "fmbo=%d mb=%d d8=%d crop=%d [%u %u %u %u])\n",
+                            type, nt, sl, si.w, si.h, si.fmbo,
+                            si.mb_adaptive, si.direct8x8, si.crop_flag,
+                            si.crop[0], si.crop[1], si.crop[2], si.crop[3]);
+                /* emit SC + the synthesized SPS (chain write) */
+                if (out_fd >= 0) {
+                    r = write_all_fd_wait(out_fd, p + s, 4);
+                    if (r == 0)
+                        r = write_all_fd_wait(out_fd, spsbuf, sl);
+                } else {
+                    r = (fwrite(p + s, 1, 4, out) == 4 &&
+                         fwrite(spsbuf, 1, sl, out) == sl) ? 0 : -2;
+                    if (out)
+                        fflush(out);
+                }
+                if (r == 0) {
+                    g_nals++;
+                    g_bytes += 4 + sl;
+                }
+                i = e;
+                continue;
             }
-            if (tl > 0 && tl + 4 < (size_t)(e - s))
-                e = s + 4 + (uint32_t)tl;   /* trim the glued metadata */
+            /* parse failed or an unsupported poc type: emit the
+             * original NAL untrimmed */
             stage = 1;
             chain_nal = 1;
         } else if (nt == 8) {          /* PPS */
+            uint32_t body = e - s - 4;
             if (stage < 1) {
                 i = e;
                 continue;              /* before any SPS: drop */
             }
+            /* The PPS NAL runs to the next start code: the zero
+             * padding before the IDR rides inside it and the decoder
+             * parses that as PPS syntax and dies ("pps_id out of
+             * range"). The body ends at the last nonzero byte (the
+             * stop/padding byte). Some chains carry a DEGENERATE
+             * PPS (a zeros-only body): emitting its header alone
+             * poisons the decoder - validate the body (pps_id and
+             * sps_id ue must both parse) and DROP it otherwise; the
+             * decoder keeps the previous chain's PPS. */
+            while (body > 0 && p[s + 4 + body - 1] == 0)
+                body--;
             {
-                /* The PPS NAL runs to the next start code - the
-                 * zero padding before the IDR rides inside it, and
-                 * the decoder parses that as PPS syntax and dies
-                 * ("pps_id out of range"). Trim to the rbsp stop. */
-                size_t tl = parse_pps_len(p + s + 4, (size_t)(e - s - 4));
-                if (tl > 0 && tl + 4 < (size_t)(e - s))
-                    e = s + 4 + (uint32_t)tl;
+                size_t bp = 0;
+                unsigned a, b;
+                if (body < 2) {
+                    i = e;
+                    continue;
+                }
+                a = sps_read_ue(p + s + 4, body, &bp);
+                b = sps_read_ue(p + s + 4, body, &bp);
+                if (a == 0xFFFF || b == 0xFFFF || bp > body * 8) {
+                    if (f2f_trace())
+                        fprintf(stderr, "rec: degenerate PPS dropped\n");
+                    i = e;
+                    continue;
+                }
             }
+            e = s + 4 + body;
             stage = 2;
             chain_nal = 1;
         } else if (nt == 5) {          /* IDR: completes the chain */
@@ -704,7 +607,12 @@ static int emit_record(const uint8_t *p, uint32_t len, uint16_t type)
                 continue;              /* mid-GOP: drop until the join */
             }
             chain_nal = 0;             /* whole-or-drop */
-        } else {                       /* SEI/AUD/junk */
+        } else if (nt == 9) {          /* AUD: decoders don't need it, and
+                                         * it is new in this era's records -
+                                         * drop it */
+            i = e;
+            continue;
+        } else {                       /* SEI/junk */
             if (!chain_open && stage == 0) {
                 i = e;
                 continue;
@@ -772,10 +680,8 @@ static void reader_loop(void)
 
             while (left > 26) {
                 rec_hdr h;
-                uint32_t mh;
                 ring_copy(off, &h, sizeof(h));
-                mh = h.magic & 0xffff0000u;
-                if (mh != 0x6a8c0000u && mh != 0x6a890000u)
+                if (!magic_ok(h.magic))
                     break;             /* torn/stale: stop, retry next poll */
                 if (26 + h.len > left || h.len > MAXPAY)
                     break;
@@ -822,8 +728,19 @@ static void reader_loop(void)
         if (one_shot && budget && --budget == 0)
             one_shot_done = 1;
         if (emit_record(payload, cur_len, cur_type) == -2) {
-            perror("write");
-            return;
+            /* A broken pipe (the readers briefly vanished - e.g. the
+             * server between clients) must not kill the reader: reopen
+             * the write end and drop this one NAL. */
+            if (out_fd >= 0) {
+                fprintf(stderr, "fifo: reopen after %s\n", strerror(errno));
+                close(out_fd);
+                out_fd = open(g_fifo_name, O_WRONLY | O_NONBLOCK);
+                if (out_fd < 0)
+                    perror("reopen");
+            } else {
+                perror("write");
+                return;
+            }
         }
         if (one_shot_done)
             return;
@@ -859,10 +776,8 @@ static int claim_slot(int want_slot)
             uint32_t newest = hdr_u32(HDR_SEQ);
             while (left > 26) {
                 rec_hdr h;
-                uint32_t mh;
                 ring_copy(off, &h, sizeof(h));
-                mh = h.magic & 0xffff0000u;
-                if (mh != 0x6a8c0000u && mh != 0x6a890000u)
+                if (!magic_ok(h.magic))
                     break;
                 if (26 + h.len > left || h.len > MAXPAY)
                     break;
@@ -928,7 +843,7 @@ int main(int argc, char **argv)
 
     while ((opt = getopt(argc, argv, "f:o:ns:h")) != -1) {
         switch (opt) {
-        case 'f': fifo_name = optarg; break;
+        case 'f': fifo_name = optarg; g_fifo_name = optarg; break;
         case 'o': out_file = optarg; break;
         case 'n': one_shot = 1; break;
         case 's': want_slot = atoi(optarg); break;
