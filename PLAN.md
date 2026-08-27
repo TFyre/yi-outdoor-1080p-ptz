@@ -79,7 +79,37 @@ boot; without it boot leaves the chain down, and it is started by hand
 with `sh /tmp/sd/hack/start-rtsp.sh`. Deployed to the SD (md5-checked
 match with `deploy/hack/boot.sh`). The chain is currently DOWN.
 
-## Secondary objective (BLOCKED on the primary): the RTSP server stall
+## Secondary objective (primary settled 2026-08-27): the RTSP server stall
+
+**Server changes vs stock yi-hack-v5 (inventoried 2026-08-27 — the
+"zoom out" question):** the diff surface is 3 files in `tools/vendor/`,
+and none of it was fifo-health compensation:
+
+- `rRTSPServer.cpp`: ZERO changes (upstream already ships
+  maxSize=262144; the plan's truncation line cited that upstream line).
+- `H264VideoFifoServerMediaSubsession`: ONE change — playTimePerFrame
+  50000→0. A live555 pacing misconfiguration (50 ms PER PACKET → the
+  12 s stalls / frozen frame). Real server bug; keep.
+- `RTPInterface.cpp`: slow-client drop (a paused player wedged the
+  single-threaded event loop). Client-behavior defense; keep.
+- `ByteStreamFifoSource.cpp`: the real rework — 1 MB fifo
+  (F_SETPIPE_SZ: chains are 300-500 KB and must fit whole — driven by
+  chain SIZE, not producer health), drain→keep-last-chain (join
+  decode + live-edge, no backlog replay), heartbeat poll (the server
+  must never stop reading the fifo — the unresolved stall lives in
+  this area), 4-byte SC handling (now producer-side too; harmless
+  belt-and-braces), F2F_TEE forensics tee (env-gated; keep for the
+  stall work). One fifo-compensation experiment (session-gap skip,
+  f81439f) was already reverted.
+- Everything else (ADTS framer, DummySink, the 20 fps / PRES_TIME_CLOCK
+  live555 patch, NO_OPENSSL, the %lld SDP sed) is the upstream baseline
+  or platform build fixes — untouched by us.
+
+Verdict: do NOT start from scratch. With the producer provably clean,
+the stall hunt can trust the input completely and focus on the
+server's parse/sink chain — the only suspect left, matching the
+hypotheses below.
+
 
 Current understanding when we return to it:
 
@@ -104,15 +134,19 @@ Current understanding when we return to it:
   in the live555 H264or5VideoStreamParser state machine stalls on this
   era's NAL pattern (double synthesized SPS, 4-byte PPS, AUDs before
   slices). Not yet pinpointed.
-- **Offline repro is ready** (built 2026-08-27, with debug symbols):
-  `analysis/upstream-yi-hack-v5/src/rRTSPServer/live-host/rRTSPServer`
-  — x86_64 native, vendored sources applied, built with NO_OPENSSL,
-  **fifo path sed-patched to `/tmp/h264_fifo2`** (the original
-  `/tmp/h264_high_fifo` is held by a stale root-owned process from an
-  old session). Repro recipe: `mkfifo /tmp/h264_fifo2`, a python feeder
-  looping `/tmp/feed.h264` (single open, 4 KB chunks — no writer gaps),
-  run the server with `-d 4`, capture with ffmpeg. Next step there:
-  strace/gdb the parse chain at the moment it stops requesting.
+- **Offline repro refreshed (2026-08-27)**: the tree's
+  `src/ByteStreamFifoSource.cpp` had been byte-identical to upstream —
+  missing the heartbeat poll, 1 MB F_SETPIPE_SZ growth, drain-keep-
+  chain, and tee. `build-rtspserver-native.sh` now applies
+  `tools/vendor/` first (same as the armv6 script), sed-patches the
+  fifo path to `/tmp/h264_fifo2` (native-only; the camera's path is
+  held by a stale root-owned WSL process), builds with `-O0 -g`, and
+  no longer uses `-j` (the link raced libliveMedia.a). Rebuilt and
+  verified: vendor copy matches, F2F_TEE compiled in. Repro recipe:
+  `mkfifo /tmp/h264_fifo2`, a python feeder looping `/tmp/feed.h264`
+  (single open, 4 KB chunks — no writer gaps), server with `-d 4`,
+  capture with ffmpeg. Next step: strace/gdb the parse chain at the
+  moment it stops requesting.
 
 ## Camera state caveats for the fresh session
 
