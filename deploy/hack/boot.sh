@@ -50,6 +50,12 @@ fi
 
 # 4. RTSP chain — detached: the stock app (rmm) creates the shared frame
 #    buffer only once the camera pipeline is up, well after boot finishes.
-nohup $HACK/start-rtsp.sh >/tmp/rtsp-boot.log 2>&1 &
+#    Auto-start is OPT-IN: it runs only when the flag file auto-rtsp
+#    exists on the SD (enable: touch /tmp/sd/hack/auto-rtsp). Without it
+#    boot leaves the chain down — bring it up by hand with
+#    `sh /tmp/sd/hack/start-rtsp.sh`.
+if [ -f $HACK/auto-rtsp ]; then
+  nohup $HACK/start-rtsp.sh >/tmp/rtsp-boot.log 2>&1 &
+fi
 
 exit 0
