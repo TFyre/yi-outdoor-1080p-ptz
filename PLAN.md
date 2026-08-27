@@ -160,6 +160,29 @@ found with strace+gdb on the offline repro:**
   capture with ffmpeg. Next step: strace/gdb the parse chain at the
   moment it stops requesting.
 
+## Audio (future work, status 2026-08-27)
+
+The live stream is VIDEO-ONLY: the server logs "Audio fifo does not
+exist, disabling audio" at startup and serves a video-only SDP. The
+upstream server's audio path is ready and gated on a fifo:
+`ADTSAudioFifoSource` reading **`/tmp/aac_audio_fifo`** (ADTS-framed
+AAC), added as a substream of the same session. Nothing writes that
+fifo — our producer filters the ring for hi-res video only.
+
+The audio data IS in the ring: ~198 `0x0100` records per lap (raw AAC
+payloads, no ADTS headers, tail `00 00 ff f9`). The path to audio:
+
+1. A second fshare2fifo mode filtering `0x0100`, extracting the AAC
+   payloads, wrapping each in an ADTS header (needs the AAC sample
+   rate/profile/channel config — the ring's audio chain records would
+   tell us), and writing `/tmp/aac_audio_fifo`. The server's audio
+   substream then lights up automatically.
+2. Verify the client muxes the interleaved audio track cleanly.
+
+Unknowns: AAC sample rate/channel config, whether the audio records
+carry their own codec-config chain (the era90 snapshot's 0x0100
+records have no chain-parts analyzed yet).
+
 ## Camera state caveats for the fresh session
 
 - The user reports the camera **reboots after a while — something is
