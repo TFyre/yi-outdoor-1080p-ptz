@@ -71,13 +71,37 @@ This is the live plan. The user drives each step; nothing here is auto-approved.
    (drops=0, full source rate, quality great per the user). Awaiting
    the user's OK to move to the RTSP stall work.
 
-## Auto-start of the RTSP chain is now OPT-IN (2026-08-27)
+## Auto-start of the RTSP chain is OPT-IN — currently ENABLED (2026-08-27)
 
 `hack/boot.sh` gates the `start-rtsp.sh` spawn behind a flag file:
 create `/tmp/sd/hack/auto-rtsp` (any content) to bring the chain up at
 boot; without it boot leaves the chain down, and it is started by hand
 with `sh /tmp/sd/hack/start-rtsp.sh`. Deployed to the SD (md5-checked
-match with `deploy/hack/boot.sh`). The chain is currently DOWN.
+match with `deploy/hack/boot.sh`). The user enabled the flag after the
+live verification: the chain now comes up automatically at every boot
+and the watcher keeps it up.
+
+## Next item (IN PROGRESS): survive ring mode flips
+
+The ring switches MID-UPTIME between the record-framed mode (the v2
+walk's native format) and the raw Annex-B mode (documented in
+CLAUDE.md's ring-format section; verified live pre-v2: the c0 entries
+vanish while the encoder keeps running). The v2 walk is record-only —
+it has NO raw-mode fallback (the whole v1 machinery was deleted in
+d34df8c) — so a flip to raw mode would silence the producer exactly
+like the magic-era flip did, until records return. Today's magic-era
+fix handled the prefix drift; the mode flip itself is still open.
+
+Plan:
+1. Establish whether raw mode still occurs on this firmware: watch the
+   live ring for record-magic density over hours (a low-frequency
+   sampler), and re-examine the old `analysis/s*.bin` snapshots.
+2. If it occurs: add a fallback to the v2 walk — detect "records
+   stale while the ring flows" (pending silent, valid/seq advancing),
+   then either resume the record walk when records return or switch to
+   a simplified raw Annex-B NAL walk (recover the v1 walk's essentials
+   from git history rather than its full diff-sampler machinery).
+3. Rebuild, deploy, verify (offline repro first, then live).
 
 ## Secondary objective (primary settled 2026-08-27): the RTSP server stall
 
