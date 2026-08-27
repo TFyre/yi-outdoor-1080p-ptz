@@ -184,6 +184,21 @@ found with strace+gdb on the offline repro:**
   capture with ffmpeg. Next step: strace/gdb the parse chain at the
   moment it stops requesting.
 
+## Scratch cleanup (2026-08-27)
+
+The truncation fix (c77c753) landed 2026-08-27 10:00 — every recording
+from Aug 26 and earlier predates it and carries the cabac-tail bug (and
+earlier-era quirks). Cleaned out of `analysis/` and WSL `/tmp`: the 52
+pre-era90 ring snapshots (the mode conclusion above was recorded
+first), all pre-Aug-27 media captures (.h264/.ts), the old OSD-test
+artifacts, and the old helper scripts. Kept: `cap60.h264` and
+`ring-era90.bin` (today's clean captures), the build trees/toolchains,
+stock-firmware material, docs, and the parallel audio session's files.
+Impact: none of today's conclusions depend on the deleted files — the
+stall mechanism (pacing + drop) is content-independent and was
+re-verified with the post-fix feed2 + the live camera; the snapshots
+were app-side ring ground truth, not walk output.
+
 ## Audio (IMPLEMENTED + verified offline 2026-08-27; camera run is user-driven)
 
 The live stream was VIDEO-ONLY: the server logs "Audio fifo does not
