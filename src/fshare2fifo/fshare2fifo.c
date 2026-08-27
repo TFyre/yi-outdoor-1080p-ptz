@@ -165,8 +165,16 @@ typedef struct {
  * (post-reboot) - only 0x6a8x is fixed. */
 static int magic_ok(uint32_t m)
 {
-    unsigned hi = m >> 16;
-    return hi >= 0x6a80 && hi <= 0x6a8f;
+    /* The record magic's hi16 drifts per writer era: 0x6a8a, 0x6a8c were
+     * observed, and on 2026-08-27 the app's writer moved to 0x6a90
+     * mid-uptime - the old 0x6a80..0x6a8f range rejected every record
+     * of the new era and the walk stalled forever (0 emission while
+     * the seq counter kept marching). The prefix is not a class; the
+     * low bytes are writer/sequence noise, and the real torn-record
+     * protection is the cascade that follows this gate (len vs left and
+     * MAXPAY, seq vs newest, type vs filter, next-record magic). Accept
+     * any 0x6aXX so an era change can never stall the walk again. */
+    return (m >> 16) >= 0x6a00 && (m >> 16) <= 0x6aff;
 }
 
 /* Is this record wanted by a slot with this cursor and filter? The
