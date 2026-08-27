@@ -254,6 +254,53 @@ clean. NOT yet done (the user drives it): deploy `f2f_audio` + the new
 start-rtsp.sh to the SD, restart the chain, and listen to
 `rtsp://10.1.2.19/ch0_0.h264` (video+audio interleaved).
 
+## Next workstream (RECON DONE 2026-08-27, implementation pending): PTZ control + web UI
+
+The last core goals (RTSP ✓, SSH ✓, web UI ✗, PTZ ✗). Overnight recon
+findings — binaries pulled to `analysis/app/` (gitignored):
+
+- **No stock web UI exists** (listening ports: 554/2222/21/23/9999
+  only). busybox httpd 1.38 is on the camera with CGI — the UI server
+  is free.
+- **The app's IPC is named POSIX mqueues**: `/ipc_dispatch`,
+  `/ipc_dispatch_worker`, `/ipc_cloud`, `/ipc_p2p`, `/ipc_rmm`,
+  `/ipc_rcd`, `/ipc_rtmp`, `/ipc_mdns` (dispatch strings; messages
+  ≤512 B, depth 16, mode 0666 O_RDWR|O_CREAT|O_NONBLOCK).
+- **The PTZ brain is `dispatch`** (120 KB, /home/app/dispatch, pid
+  holds fh_pwm): cloud PTZ arrives via P2P (p2p_tnp) → cloudAPI → the
+  `/ipc_dispatch` mqueue → `p2p_ptz_direction_ctrl` reads the cloud
+  message's PTZ fields at offsets 561 (func char), 562, 582, normalizes
+  the direction (mount-inversion swaps 1↔2 and 3↔4), and forwards a
+  24-byte command on a second mqueue. The motor hardware path is a
+  **UART to the CPLD motor board**: `uart_ptz_open` / `uart_com_init` /
+  `uart_com_send_cmd` on `/dev/ttyS1`, plus `/dev/cpld_periph` ioctls
+  (0x7004/0x700a/0x7025 seen). `get_ptz_position` + "save device ptz
+  position(%d,%d)" → position persists in the mtd productinfo.
+- **The command envelope matches upstream yi-hack-v5's ipc_cmd
+  protocol** (same app family): MOVE = `{u32 1, u32 8, u16 0x4006,
+  u16 0x4006, u32 24, u32 dir, u32 0}` with dir 1=up 2=down 3=left
+  4=right; STOP = `{1, 8, 0x4007, 0x0001, 0}`; presets 0x4000/1/2,
+  cruise 0x4003/4/5, jump 0x4009 (x/y at offsets 16/20), LED 0x76/77.
+  Upstream sends these to the app's mqueue via their `ipc_cmd` tool.
+- **Snapshot**: the app writes `/tmp/panorama_capture/%d.jpg` (a
+  DISPATCH_SET_PANORAMA_CAPTURE_STATE command exists) — likely
+  triggerable via the same mqueue; confirm the command id from
+  dispatch's 0x40xx table.
+- Factory helpers (read_dev/write_dev/read_gpio/write_gpio) are
+  productinfo provisioning tools, not motor tools.
+
+**Implementation plan:**
+1. (With the user) strace `dispatch` during a phone-driven pan: confirm
+   the exact target mqueue + message bytes end-to-end.
+2. Write `ptz` — a ~100-line static tool: `mq_open` + `mq_send` of the
+   MOVE/STOP envelopes (+ presets/jump). NO motor movement until the
+   user is present.
+3. Web UI: busybox httpd on 8080 from the SD + a CGI (upstream's
+   ptz.sh pattern: `ptz -m <dir>; sleep 0.3; ptz -m stop`), PTZ pad +
+   snapshot + RTSP link.
+4. Deploy (SD additions only), verify with the user watching, wire
+   into boot.sh if wanted.
+
 ## Camera state caveats for the fresh session
 
 - The user reports the camera **reboots after a while — something is
