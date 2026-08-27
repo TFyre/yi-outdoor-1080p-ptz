@@ -24,6 +24,7 @@ along with this library; if not, write to the Free Software Foundation, Inc.,
 #include <GroupsockHelper.hh>
 #include <stdio.h>
 #include <stdlib.h>
+#include <poll.h>
 
 ////////// Helper Functions - Definition //////////
 
@@ -370,24 +371,48 @@ Boolean RTPInterface::sendDataOverTCP(int socketNum, u_int8_t const* data, unsig
 
     unsigned numBytesSentSoFar = sendResult < 0 ? 0 : (unsigned)sendResult;
     if (numBytesSentSoFar > 0 || (forceSendToSucceed && envir().getErrno() == EAGAIN)) {
-      // The OS's TCP send buffer has filled up (the client is not keeping
-      // up). Upstream live555 retries with a blocking send + SO_SNDTIMEO;
-      // on this single-threaded server that stalls the WHOLE event loop
-      // (every packet, every client) whenever one client stops reading -
-      // measured live: a client that stopped ACKing wedged the server with
-      // ~56 KB stuck in the tx_queue, retransmits piling up, the source
-      // stopped being read ("retry fired, not awaiting") and the fifo
-      // filling to 1 MB with the producer blocked. Never block: a
-      // mid-packet failure corrupts the interleaved framing for that
-      // client anyway, so drop its RTP stream and keep serving everyone
-      // else. The client can reconnect; the camera must not freeze.
-      if (getenv("RTSP_DROP_LOG") != NULL) {
-	fprintf(stderr, "sendDataOverTCP: send buffer full (%u of %u bytes sent); dropping client's RTP stream\n",
-		numBytesSentSoFar, dataSize);
-	fflush(stderr);
+      // Partial send: the TCP send buffer is full. A HEALTHY client
+      // drains it within milliseconds (this is the normal outcome of an
+      // unpaced send burst - the drain-kept chain alone is ~90 KB of
+      // packets back-to-back); a stalled client (paused player) never
+      // does. Upstream live555 retries with a blocking send +
+      // SO_SNDTIMEO, which wedges this single-threaded event loop
+      // whenever one client stops reading (measured: ~56 KB stuck in
+      // the tx_queue, the source unread, the fifo full, the producer
+      // blocked). Compromise: complete the packet with a bounded
+      // poll-writable wait. Healthy clients cost microseconds (writable
+      // almost immediately); a client that stays unwritable for the
+      // whole budget is genuinely stalled - drop its RTP stream (the
+      // interleaved framing is corrupt for it anyway) and keep serving
+      // everyone else.
+      struct timeval start, now;
+      gettimeofday(&start, NULL);
+      while (numBytesSentSoFar < dataSize) {
+        int sent = send(socketNum, (char const*)data + numBytesSentSoFar,
+                        dataSize - numBytesSentSoFar, 0);
+        if (sent > 0) { numBytesSentSoFar += (unsigned)sent; continue; }
+        if (sent < 0 && envir().getErrno() != EAGAIN) {
+          removeStreamSocket(socketNum, 0xFF);
+          return False;
+        }
+        gettimeofday(&now, NULL);
+        long elapsedUs = (long)(now.tv_sec - start.tv_sec)*1000000
+                       + (now.tv_usec - start.tv_usec);
+        long remainingUs = RTPINTERFACE_BLOCKING_WRITE_TIMEOUT_MS*1000L - elapsedUs;
+        if (remainingUs <= 0) {
+          if (getenv("RTSP_DROP_LOG") != NULL) {
+            fprintf(stderr, "sendDataOverTCP: client stalled (%u of %u bytes sent after %d ms); dropping client's RTP stream\n",
+                    numBytesSentSoFar, dataSize, RTPINTERFACE_BLOCKING_WRITE_TIMEOUT_MS);
+            fflush(stderr);
+          }
+          removeStreamSocket(socketNum, 0xFF);
+          return False;
+        }
+        struct pollfd pfd;
+        pfd.fd = socketNum; pfd.events = POLLOUT; pfd.revents = 0;
+        poll(&pfd, 1, (int)((remainingUs + 999)/1000));
       }
-      removeStreamSocket(socketNum, 0xFF);
-      return False;
+      return True;
     } else if (sendResult < 0 && envir().getErrno() != EAGAIN) {
       // Because the "send()" call failed, assume that the socket is now unusable, so stop
       // using it (for both RTP and RTCP):

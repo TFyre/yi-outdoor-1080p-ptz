@@ -92,6 +92,7 @@ build_rtspserver() {
     cp "$REPO/tools/vendor/ByteStreamFifoSource.hh" "$LIVE/liveMedia/include/"
     cp "$REPO/tools/vendor/ByteStreamFifoSource.cpp" "$LIVE/src/"
     cp "$REPO/tools/vendor/RTPInterface.cpp" "$LIVE/liveMedia/"
+    cp "$REPO/tools/vendor/MultiFramedRTPSink.cpp" "$LIVE/liveMedia/"
     sed -i 's/fFrameRate = 30.0/fFrameRate = 20.0/' "$LIVE/liveMedia/H264or5VideoStreamFramer.cpp"
     # musl 32-bit ARM: time_t is 64-bit; the upstream %ld printf reads only
     # 32 bits, misaligning every subsequent vararg and crashing sprintf.

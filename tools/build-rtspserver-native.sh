@@ -18,6 +18,7 @@ cp "$REPO/tools/vendor/ADTSAudioStreamDiscreteFramer.cpp" "$LIVE/liveMedia/"
 cp "$REPO/tools/vendor/ByteStreamFifoSource.hh" "$LIVE/liveMedia/include/"
 cp "$REPO/tools/vendor/ByteStreamFifoSource.cpp" "$LIVE/src/"
 cp "$REPO/tools/vendor/RTPInterface.cpp" "$LIVE/liveMedia/"
+cp "$REPO/tools/vendor/MultiFramedRTPSink.cpp" "$LIVE/liveMedia/"
 
 rm -rf "$SRC/live-host"
 cp -r "$SRC/live" "$SRC/live-host"
