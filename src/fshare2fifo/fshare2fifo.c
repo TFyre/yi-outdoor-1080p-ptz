@@ -501,11 +501,17 @@ static int emit_record(const uint8_t *p, uint32_t len, uint16_t type)
             break;
         s = i;
         e = s + 4;
-        /* the NAL ends at the next start code */
+        /* the NAL ends at the next start code, else at the payload
+         * end (the old scan stopped at len-3, cutting the last three
+         * bytes of every record's final NAL - the decoder then
+         * overread each slice's cabac tail by 5-9 bytes and
+         * concealed the bottom macroblock row) */
         while (e + 4 <= len &&
                !(p[e] == 0x00 && p[e + 1] == 0x00 &&
                  p[e + 2] == 0x00 && p[e + 3] == 0x01))
             e++;
+        if (e + 4 > len)
+            e = len;
         if (e - s < 5) {               /* empty NAL: skip */
             i = e;
             continue;
