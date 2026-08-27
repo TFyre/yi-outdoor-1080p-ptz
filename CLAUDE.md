@@ -60,17 +60,25 @@ on the SD root is a one-liner that execs `hack/boot.sh` at every boot.
   return).
 - `hack/start-rtsp.sh` — waits for `/dev/shm/fshare_frame_buf` (the app
   creates it once the camera pipeline is up), then starts the chain in
-  this order: **rRTSPServer first** (its startup drain discards buffered
-  fifo content, so it must open the fifo before the producer writes), then
-  **fshare2fifo** (retried until it survives). Idempotent. Then a watch
-  loop runs for the whole uptime: it respawns the producer (a sitting
-  duck for the OOM killer) or the server (dies when the fifo briefly
-  loses its writer) whenever either disappears. Limitation: if rmm
-  restarts mid-uptime and recreates its buffer, the producer's mmap goes
-  stale — re-run the script or reboot.
+  this order: **f2f_audio first** (ADTSAudioFifoSource::createNew sits in
+  a syncword scan until the audio fifo has a writer, and with no writer
+  EVER the server start hangs — video included; if the producer never
+  comes up the script unlinks the fifo so the server's stat() check
+  disables audio cleanly), then **rRTSPServer** (no `-a no` — audio is on
+  and gated by the fifo's existence; its startup drain discards buffered
+  fifo content), then **fshare2fifo** (retried until it survives).
+  Idempotent. Then a watch loop runs for the whole uptime: it respawns
+  either producer (sitting ducks for the OOM killer) or the server (dies
+  when a fifo briefly loses its writer) whenever one disappears; a failed
+  audio respawn unlinks the audio fifo so the next server start degrades
+  to video-only instead of hanging. Limitation: if rmm restarts
+  mid-uptime and recreates its buffer, the producers' mmaps go stale —
+  re-run the script or reboot.
 - `hack/bin/` — binaries, all static armv6 (gitignored, rebuilt with
   `tools/build-*.sh` in WSL): busybox 1.38.0, curl 8.21.0 (http-only, no
-  TLS), dropbearmulti 2026.94 (built from source), fshare2fifo, rRTSPServer.
+  TLS), dropbearmulti 2026.94 (built from source), fshare2fifo, f2f_audio
+  (the same binary under a name whose comm fits pidof; argv[0] dispatch
+  turns on audio mode), rRTSPServer.
 - `hack/root/.ssh/authorized_keys` — pubkeys boot.sh installs to
   `/root/.ssh/` each boot (the ramdisk resets).
 - `hack/etc/dropbear/ecdsa.key` — host key (gitignored; boot.sh regenerates
@@ -261,6 +269,29 @@ single-threaded event loop — one slow client froze the whole camera
 producer blocking). The vendored RTPInterface now drops such a client's
 RTP stream instead of blocking (RTSP_DROP_LOG=1 logs it); verified with
 a raw-socket client that streams then stops reading.
+
+**Audio (2026-08-27)**: the ring's 0x0100 records carry the audio, and
+every payload is already ONE COMPLETE MPEG-2 ADTS frame — `ff f9` sync,
+profile AAC-LC, **16 kHz, mono**, protection absent, and the ADTS
+frame_length equals the record length exactly (171/170 B; 21.4 kbps,
+15.6 frames/s, 64 ms/frame). No 0x01xx codec-config records exist; the
+ADTS header is the whole config. So `fshare2fifo -a` (or the deployed
+copy `f2f_audio`, argv[0]-dispatched) just passes 0x0100 payloads
+through whole to `/tmp/aac_audio_fifo` (filter 0x0100, no chain gate,
+cursor seeded 0 with the live-edge jump, purger trim 16 KB). The server
+needs no changes: ADTSAudioFifoSource parses the ADTS header for the
+SDP config ("1408"), strips it per frame, and MPEG4GenericRTPSink
+payloads; the vendored MultiFramedRTPSink pacing removal also un-paces
+the audio sink while the source's 64 ms presentation-time increments
+keep the RTP timestamps right. `rtsp://10.1.2.19/ch0_2.h264` is the
+audio-only stream; ch0_0/ch0_1 interleave it. Verified offline: the
+walk's exact ADTS output decodes 0 errors, and a native server run fed
+from the fifo logged "profile 1 … 16000 … channel_configuration 1" with
+a clean ffmpeg RTSP capture. Offline repro for audio: `analysis/audio_probe.py`
+(snapshot record stats) and a WSL x86 `fshare2fifo -a -n -o out.aac` on
+a snapshot copied to `/dev/shm/fshare_frame_buf` (the -n budget must be
+≤ the records available — on a static snapshot video -n hangs waiting
+for records that never come).
 
 **Known remaining issue**: in the hyperactive eras (~600 KB-1 MB/s
 bursts; the ring laps every ~3 s) the NAL-mode walk still churns on

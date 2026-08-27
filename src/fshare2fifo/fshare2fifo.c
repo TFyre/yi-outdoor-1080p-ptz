@@ -31,8 +31,20 @@
  * 0x0400(P slices). Join: the cursor starts at the newest 0x0422 so
  * every client's first bytes are a complete SPS->PPS->IDR chain.
  *
- * Usage: fshare2fifo [-f FIFO] [-o FILE] [-n] [-s SLOT]
- *   default output: fifo /tmp/h264_high_fifo
+ * Audio mode (-a, or run as f2f_audio): filter 0x0100 instead and
+ * pass each record's payload straight through to
+ * /tmp/aac_audio_fifo. The payload IS one complete ADTS frame - the
+ * app writes MPEG-2 ADTS directly (verified on the ring snapshots:
+ * ff f9 sync, profile AAC-LC, 16 kHz, mono, and the ADTS
+ * frame_length field equals the record length exactly), so no
+ * re-framing is needed. The server's ADTSAudioFifoSource parses the
+ * ADTS header for the SDP config and strips it per frame. There is no
+ * audio chain (no 0x01xx records exist); the ADTS header is the whole
+ * codec config.
+ *
+ * Usage: fshare2fifo [-a] [-f FIFO] [-o FILE] [-n] [-s SLOT]
+ *   default output: fifo /tmp/h264_high_fifo (audio: /tmp/aac_audio_fifo)
+ *   -a: audio mode (filter 0x0100, ADTS passthrough)
  *   -s: reader slot (default: first free of 10..14)
  *   -n: one-shot - dump up to 256 records, then exit (captures)
  *
@@ -71,12 +83,18 @@
 #define HDR_SEQ   0x18           /* newest record's sequence number */
 #define SLOT_OFF(k) (0x1Cu + 16u * (k))
 #define FILTER_HIRES 0x0400u
+#define FILTER_AUDIO 0x0100u
 #define POLL_MS 10
 #define MAXPAY  (512u * 1024)    /* the 0x0401 record carries the whole
                                     GOP head (SPS+PPS+zeros+IDR): 78 KB
                                     calm, 300-500 KB at IR-noise rates */
 #define NAL_BUF_MAX 256          /* SPS/PPS are tiny */
 #define DEFAULT_FIFO "/tmp/h264_high_fifo"
+#define DEFAULT_AUDIO_FIFO "/tmp/aac_audio_fifo"
+/* purger keep-threshold: ~5 s of 1080p at a calm bitrate for video,
+ * ~6 s of audio (171 B frames at 15.6/s) for audio */
+#define PURGE_TRIM_VIDEO (224u * 1024)
+#define PURGE_TRIM_AUDIO (16u * 1024)
 
 /* Stall watchdog (see reader_loop): ring flowing (valid moves) but no
  * record consumed for STALL_SECS -> re-anchor the cursor at the newest
@@ -95,6 +113,9 @@ static FILE *out;                  /* file output (-o FILE) */
 static int out_fd = -1;            /* fifo output, non-blocking */
 static size_t g_pipe_size = 256 * 1024;
 static volatile int stop_flag;
+static int audio_mode;             /* -a / argv[0]: ADTS passthrough */
+static uint16_t g_filter = FILTER_HIRES;
+static size_t g_purge_trim = PURGE_TRIM_VIDEO;
 static void release_slot(void);   /* defined below reader_loop; the
                                    * stall watchdog calls it */
 
@@ -206,9 +227,9 @@ static int entry_wanted(uint32_t cursor, uint16_t filter, const rec_hdr *h)
 
 /* ---- fifo purger thread (from the v1 walk, unchanged) ----
  * Holds the read end open (a fifo writer with no reader gets EPIPE)
- * and trims an idle-full fifo to a fresh ~224 KB tail so the next
- * client does not get served minutes-old content. Must never consume
- * the head while the fifo is NOT full. */
+ * and trims an idle-full fifo to a fresh tail (g_purge_trim bytes) so
+ * the next client does not get served minutes-old content. Must never
+ * consume the head while the fifo is NOT full. */
 static void *fifo_purger_thread(void *arg)
 {
     const char *fifo_name = arg;
@@ -224,9 +245,9 @@ static void *fifo_purger_thread(void *arg)
     fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBLOCK);
     while (1) {
         int n = 0;
-        if (ioctl(fd, FIONREAD, &n) == 0 && n > 224 * 1024) {
-            while (n > 224 * 1024) {
-                size_t want = (size_t)n - 224 * 1024;
+        if (ioctl(fd, FIONREAD, &n) == 0 && n > (int)g_purge_trim) {
+            while (n > (int)g_purge_trim) {
+                size_t want = (size_t)n - g_purge_trim;
                 ssize_t r;
                 if (want > sizeof(drain))
                     want = sizeof(drain);
@@ -672,6 +693,33 @@ static int emit_record(const uint8_t *p, uint32_t len, uint16_t type)
     return r;
 }
 
+/* One delivered record -> the output. Video goes through the NAL walk
+ * + chain gate (emit_record, which counts its own stats). Audio: the
+ * record payload is already one complete ADTS frame (verified on the
+ * snapshots: ff f9 sync, frame_length == record len) - pass it
+ * through whole, whole-or-drop like a P slice. */
+static int emit_delivered(const uint8_t *p, uint32_t len, uint16_t type)
+{
+    int r;
+
+    if (!audio_mode)
+        return emit_record(p, len, type);
+    if (out_fd >= 0) {
+        r = write_whole_fd(out_fd, p, len);
+    } else {
+        r = (fwrite(p, 1, len, out) == (size_t)len) ? 0 : -2;
+        if (out)
+            fflush(out);
+    }
+    if (r == 0) {
+        g_nals++;
+        g_bytes += len;
+    } else if (r == -1) {
+        g_drops++;
+    }
+    return r;
+}
+
 /* ---- the reader loop (§5.4, lock-free) ----
  * Poll slot[K].pending on a short timer (the notify semaphore is
  * deliberately skipped); while pending, walk the ring from the
@@ -715,7 +763,7 @@ static void reader_loop(void)
                     break;
                 if (h.seq == newest)
                     break;             /* the newest record may be mid-copy */
-                if (entry_wanted(slot_cursor, FILTER_HIRES, &h)) {
+                if (entry_wanted(slot_cursor, g_filter, &h)) {
                     /* Live-edge jump: when the walk's first match is
                      * far ahead of the cursor (a client stall, a slow
                      * drain), serving the backlog would trail the
@@ -827,7 +875,7 @@ static void reader_loop(void)
 
         if (one_shot && budget && --budget == 0)
             one_shot_done = 1;
-        if (emit_record(payload, cur_len, cur_type) == -2) {
+        if (emit_delivered(payload, cur_len, cur_type) == -2) {
             /* A broken pipe (the readers briefly vanished - e.g. the
              * server between clients) must not kill the reader: reopen
              * the write end and drop this one NAL. */
@@ -849,12 +897,16 @@ static void reader_loop(void)
 
 /* ---- slot claim + the join scan (lock-free) ----
  * Slots 10..14 are ours (the stock consumers use 0, 1, 2, 16). Claim
- * the first with a zero filter - or a 0x0400 filter left by our own
- * previous run (stale cursor, harmless to re-seed). Seed the cursor
- * at the newest 0x0422 chain start so the first emission is a
- * complete SPS->PPS->IDR chain. The slot writes are plain aligned
- * stores; the writer reads the filter under its own lock and never
- * reads a cursor, so there is nothing to race on. */
+ * the first with a zero filter - or a filter left by our own previous
+ * run in the same mode (stale cursor, harmless to re-seed). A slot
+ * holding the OTHER mode's filter (a live video producer while we are
+ * audio, or vice versa) is occupied and skipped. Video seeds the
+ * cursor at the newest 0x0422 chain start so the first emission is a
+ * complete SPS->PPS->IDR chain; audio has no chain, so it seeds 0
+ * (fresh reader, consume from the tail) and the live-edge jump lands
+ * it one record behind the head on the first poll. The slot writes
+ * are plain aligned stores; the writer reads the filter under its own
+ * lock and never reads a cursor, so there is nothing to race on. */
 static int claim_slot(int want_slot)
 {
     int k;
@@ -866,11 +918,12 @@ static int claim_slot(int want_slot)
         uint32_t best = 0;
 
         filt = hdr_u32(SLOT_OFF(k) + 12) & 0xFFFF;
-        if (filt != 0 && filt != FILTER_HIRES)
+        if (filt != 0 && filt != g_filter)
             continue;                  /* occupied by someone else */
-        /* seed the cursor: the newest 0x0422 with at least 4 records
-         * after it (its IDR is then written too: a complete chain) */
-        {
+        if (!audio_mode) {
+            /* seed the cursor: the newest 0x0422 with at least 4
+             * records after it (its IDR is then written too: a
+             * complete chain) */
             uint32_t off = hdr_u32(HDR_TAIL);
             uint32_t left = hdr_u32(HDR_VALID);
             uint32_t newest = hdr_u32(HDR_SEQ);
@@ -888,23 +941,24 @@ static int claim_slot(int want_slot)
                 off = (off + 26 + h.len) % DATA_SZ;
                 left -= 26 + h.len;
             }
+            /* cursor = the chain start MINUS one: the 0x0422 itself
+             * must be delivered (entry_wanted wants seq >= cursor+1)
+             * so the chain gate can open on it */
+            if (best)
+                best--;
         }
-        /* cursor = the chain start MINUS one: the 0x0422 itself must
-         * be delivered (entry_wanted wants seq >= cursor+1) so the
-         * chain gate can open on it */
-        if (best)
-            best--;
-        slot_wr_u32(SLOT_OFF(k) + 8, best ? best : hdr_u32(HDR_SEQ));
+        slot_wr_u32(SLOT_OFF(k) + 8,
+                    best ? best : (audio_mode ? 0u : hdr_u32(HDR_SEQ)));
         slot_wr_u32(SLOT_OFF(k), 1);          /* pending: poll starts */
-        slot_cursor = best ? best : hdr_u32(HDR_SEQ);
+        slot_cursor = best ? best : (audio_mode ? 0u : hdr_u32(HDR_SEQ));
         /* publish the filter: a single aligned u16 store */
         {
-            uint16_t f = FILTER_HIRES;
+            uint16_t f = g_filter;
             memcpy((void *)(buf + SLOT_OFF(k) + 12), &f, 2);
         }
         slot_k = k;
         fprintf(stderr, "slot %d claimed (filter 0x%04x, cursor %u)\n",
-                k, FILTER_HIRES, slot_cursor);
+                k, g_filter, slot_cursor);
         return 0;
     }
     fprintf(stderr, "no free slot in %d..%d\n", first, last);
@@ -936,21 +990,42 @@ int main(int argc, char **argv)
     const char *fifo_name = DEFAULT_FIFO;
     const char *out_file = NULL;
     int want_slot = -1;
+    int fifo_set = 0;
     int opt;
     int fd;
     struct stat st;
     pthread_t unlock_thread;
 
-    while ((opt = getopt(argc, argv, "f:o:ns:h")) != -1) {
+    /* run as f2f_audio == audio mode (the deployed copy's name; comm
+     * stays short enough for pidof, see start-rtsp.sh) */
+    {
+        const char *pn = strrchr(argv[0], '/');
+        pn = pn ? pn + 1 : argv[0];
+        if (strcmp(pn, "f2f_audio") == 0)
+            audio_mode = 1;
+    }
+
+    while ((opt = getopt(argc, argv, "af:o:ns:h")) != -1) {
         switch (opt) {
-        case 'f': fifo_name = optarg; g_fifo_name = optarg; break;
+        case 'a': audio_mode = 1; break;
+        case 'f': fifo_name = optarg; g_fifo_name = optarg; fifo_set = 1; break;
         case 'o': out_file = optarg; break;
         case 'n': one_shot = 1; break;
         case 's': want_slot = atoi(optarg); break;
         default:
-            fprintf(stderr, "usage: %s [-f FIFO] [-o FILE] [-n] [-s SLOT]\n",
+            fprintf(stderr,
+                    "usage: %s [-a] [-f FIFO] [-o FILE] [-n] [-s SLOT]\n",
                     argv[0]);
             return 1;
+        }
+    }
+
+    if (audio_mode) {
+        g_filter = FILTER_AUDIO;
+        g_purge_trim = PURGE_TRIM_AUDIO;
+        if (!fifo_set) {
+            fifo_name = DEFAULT_AUDIO_FIFO;
+            g_fifo_name = DEFAULT_AUDIO_FIFO;
         }
     }
 

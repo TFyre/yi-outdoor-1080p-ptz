@@ -6,9 +6,11 @@ analysis/*
 !analysis/*.md
 !analysis/verify_fshare_map.py
 !analysis/slotwatch.c
+!analysis/audio_probe.py
 
 # build artifacts (reproducible via tools/build-*.sh in WSL)
 src/fshare2fifo/fshare2fifo
+src/fshare2fifo/f2f_audio
 tools/probe-vfp
 tools/probe-vfp2
 deploy/hack/bin/

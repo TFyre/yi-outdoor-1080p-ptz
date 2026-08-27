@@ -38,7 +38,10 @@ build_fshare2fifo() {
     cd "$REPO/src/fshare2fifo"
     ${CROSS}-gcc $FLAGS -Wall -o fshare2fifo fshare2fifo.c -lpthread
     verify_armv6 fshare2fifo
-    ls -la fshare2fifo
+    # The audio producer is the same binary under a name whose comm
+    # fits pidof (<= 15 chars); argv[0] dispatch turns on audio mode.
+    cp fshare2fifo f2f_audio
+    ls -la fshare2fifo f2f_audio
 }
 
 build_ringcapture() {

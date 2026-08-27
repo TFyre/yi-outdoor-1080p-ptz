@@ -184,28 +184,60 @@ found with strace+gdb on the offline repro:**
   capture with ffmpeg. Next step: strace/gdb the parse chain at the
   moment it stops requesting.
 
-## Audio (future work, status 2026-08-27)
+## Audio (IMPLEMENTED + verified offline 2026-08-27; camera run is user-driven)
 
-The live stream is VIDEO-ONLY: the server logs "Audio fifo does not
+The live stream was VIDEO-ONLY: the server logs "Audio fifo does not
 exist, disabling audio" at startup and serves a video-only SDP. The
 upstream server's audio path is ready and gated on a fifo:
 `ADTSAudioFifoSource` reading **`/tmp/aac_audio_fifo`** (ADTS-framed
-AAC), added as a substream of the same session. Nothing writes that
-fifo — our producer filters the ring for hi-res video only.
+AAC), added as a substream of the same session. Nothing wrote that
+fifo — the producer filtered the ring for hi-res video only.
 
-The audio data IS in the ring: ~198 `0x0100` records per lap (raw AAC
-payloads, no ADTS headers, tail `00 00 ff f9`). The path to audio:
+**The unknowns resolved from the ring snapshots** (`analysis/audio_probe.py`,
+ring_n.bin + ring_now2.bin, 1203 audio records): every 0x0100 record's
+payload is already ONE COMPLETE ADTS frame — the app writes MPEG-2 ADTS
+directly, so the producer needs no re-framing, and there is no separate
+codec-config chain (no 0x01xx records exist):
 
-1. A second fshare2fifo mode filtering `0x0100`, extracting the AAC
-   payloads, wrapping each in an ADTS header (needs the AAC sample
-   rate/profile/channel config — the ring's audio chain records would
-   tell us), and writing `/tmp/aac_audio_fifo`. The server's audio
-   substream then lights up automatically.
-2. Verify the client muxes the interleaved audio track cleanly.
+- `ff f9` syncword + MPEG-2 ID, protection absent; `60 40` = profile 1
+  (AAC-LC), sampling_frequency_index 8 = **16 kHz**, channel_configuration
+  **1 = mono**; the ADTS frame_length field equals the record length
+  exactly (171/170 B); the payload ends in the encoder's zero padding
+  (the old "tail `00 00 ff f9`" note was the 2-byte-shifted framing).
+- Audio ts delta is a rock-steady ~65 units vs video's ~80 — at
+  1024 samples/frame that pins the ts unit at ~1 ms, the audio rate at
+  15.6 frames/s (64 ms/frame), and the record-era video of that
+  snapshot at ~12.5 fps. 21.4 kbps total; a 256-frame capture decodes
+  with 0 errors.
 
-Unknowns: AAC sample rate/channel config, whether the audio records
-carry their own codec-config chain (the era90 snapshot's 0x0100
-records have no chain-parts analyzed yet).
+**Implementation (fshare2fifo audio mode, `src/fshare2fifo/fshare2fifo.c`):**
+`-a` (or argv[0] = `f2f_audio`, the deployed copy's name — comm stays
+short enough for pidof) switches the filter to 0x0100 and passes each
+payload through whole to `/tmp/aac_audio_fifo` (whole-or-drop, purger
+trim 16 KB ≈ 6 s of audio). No chain gate: the claim seeds cursor 0 and
+the live-edge jump lands it live. The server needs NO changes — the
+deployed binary already carries the audio path; it parses the ADTS
+header for the SDP config ("1408" = AAC-LC 16 kHz mono), strips ADTS
+per frame, and the vendored MultiFramedRTPSink pacing removal (560f6c3)
+also un-paces the audio sink (the source's 64 ms/frame presentation
+times keep the RTP timestamps right).
+
+**start-rtsp.sh is now audio-first:** ADTSAudioFifoSource::createNew
+sits in a syncword scan until the fifo has a writer, and with no writer
+EVER the server start hangs forever — video included. Order: f2f_audio
+up (or the fifo removed → the server's stat() check disables audio) →
+rRTSPServer (no `-a no` anymore) → fshare2fifo. The watchdog respawns
+f2f_audio too. Server restart while the producer is down unlinks the
+fifo so the next start degrades to video-only instead of hanging.
+
+**Verified offline end-to-end (WSL):** snapshot → x86 producer `-n -o`
+→ 256-frame ADTS file (ffprobe: AAC-LC 16 kHz mono, 16.35 s, decode
+0 errors); and the fifo path → native rRTSPServer `-r none` → the
+source logged "Read first frame: profile 1, … 16000, channel_configuration 1",
+"Config string: 1408" → an ffmpeg RTSP capture of ch0_2.h264 decodes
+clean. NOT yet done (the user drives it): deploy `f2f_audio` + the new
+start-rtsp.sh to the SD, restart the chain, and listen to
+`rtsp://10.1.2.19/ch0_0.h264` (video+audio interleaved).
 
 ## Camera state caveats for the fresh session
 

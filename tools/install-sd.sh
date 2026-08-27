@@ -44,7 +44,8 @@ fi
 if [ "$CHECK" = 1 ]; then
     echo "== checking existing card content"
     for f in debug.sh hack/boot.sh hack/start-rtsp.sh hack/bin/busybox \
-             hack/bin/fshare2fifo hack/bin/rRTSPServer hack/bin/dropbearmulti \
+             hack/bin/fshare2fifo hack/bin/f2f_audio \
+             hack/bin/rRTSPServer hack/bin/dropbearmulti \
              hack/root/.ssh/authorized_keys; do
         if [ -f "$DRIVE/$f" ]; then
             echo "   ok  $f"
