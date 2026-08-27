@@ -2,6 +2,8 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+**Active work plan: read `PLAN.md` first** (updated 2026-08-27). Standing rules there: never reboot the camera; do NOT auto-start fshare2fifo/rRTSPServer; do NOT auto-verify video; the user drives each step.
+
 ## Project
 
 Firmware modification project for the **YI Outdoor 1080p PTZ** camera (yitechnology.com/outdoor-ptz): a yi-hack-v5-style mod — RTSP, SSH, web UI, PTZ control — that runs from a FAT32 microSD card and leaves the stock flash untouched.
