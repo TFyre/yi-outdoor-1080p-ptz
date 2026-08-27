@@ -229,19 +229,26 @@ static int entry_wanted(uint32_t cursor, uint16_t filter, const rec_hdr *h)
  * Holds the read end open (a fifo writer with no reader gets EPIPE)
  * and trims an idle-full fifo to a fresh tail (g_purge_trim bytes) so
  * the next client does not get served minutes-old content. Must never
- * consume the head while the fifo is NOT full. */
+ * consume the head while the fifo is NOT full.
+ *
+ * The read fd comes from main, opened in the SAME thread before the
+ * write end: the old "purger opens its own read end" order raced the
+ * first audio write on this single-core box (the thread lost the
+ * scheduling race and the write EPIPEd - three producer deaths in a
+ * row live). arg is the fd, or -1 to open by name (probe fallback). */
 static void *fifo_purger_thread(void *arg)
 {
-    const char *fifo_name = arg;
-    int fd = open(fifo_name, O_RDONLY);
+    int fd = (int)(long)arg;
     uint8_t drain[65536];
 
+    if (fd < 0)
+        fd = open(g_fifo_name, O_RDONLY);
     if (fd < 0) {
         fprintf(stderr, "purger: open %s failed (%s)\n",
-                fifo_name, strerror(errno));
+                g_fifo_name, strerror(errno));
         return NULL;
     }
-    fprintf(stderr, "purger: holding %s read end\n", fifo_name);
+    fprintf(stderr, "purger: holding %s read end\n", g_fifo_name);
     fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBLOCK);
     while (1) {
         int n = 0;
@@ -1070,8 +1077,6 @@ int main(int argc, char **argv)
             perror("mkfifo");
             return 1;
         }
-        pthread_create(&unlock_thread, NULL, fifo_purger_thread,
-                       (void *)fifo_name);
         {
             int pf = open(fifo_name, O_RDONLY | O_NONBLOCK);
             if (pf >= 0) {
@@ -1079,11 +1084,16 @@ int main(int argc, char **argv)
                 fprintf(stderr, "pipe probe: set 1MB -> %d (%s)\n",
                         ps, ps != 0 ? strerror(errno) : "ok");
                 out_fd = open(fifo_name, O_WRONLY);
-                close(pf);
                 if (out_fd < 0) {
                     perror(fifo_name);
+                    close(pf);
                     return 1;
                 }
+                /* hand pf to the purger instead of closing it: a
+                 * reader now exists BEFORE the first write, so the
+                 * write end can never EPIPE */
+                pthread_create(&unlock_thread, NULL, fifo_purger_thread,
+                               (void *)(long)pf);
             } else {
                 fprintf(stderr, "pipe probe: open failed (%s)\n",
                         strerror(errno));
@@ -1092,6 +1102,8 @@ int main(int argc, char **argv)
                     perror(fifo_name);
                     return 1;
                 }
+                pthread_create(&unlock_thread, NULL, fifo_purger_thread,
+                               (void *)(long)-1);
             }
         }
         fcntl(out_fd, F_SETFL, fcntl(out_fd, F_GETFL, 0) | O_NONBLOCK);
