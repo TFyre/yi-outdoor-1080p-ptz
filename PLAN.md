@@ -141,9 +141,11 @@ found with strace+gdb on the offline repro:**
   0 drops** (was: 1.4 MB then the drop). The refreshed repro (1 MB
   fifo + drain-keep-chain + heartbeat) never showed the old "reads
   stop forever" pattern — the pacing+trickle was its whole stall.
-- Pending: rebuild the armv6 binary, deploy to the SD, start the
-  chain (user-driven) and verify live that the camera client streams
-  continuously.
+- **VERIFIED LIVE (2026-08-27)**: the fixed binary is deployed
+  (md5-checked) and the user started the chain by hand — the client
+  streams continuously. Both objectives are closed. The chain is UP on
+  the camera right now; auto-start at boot is still opt-in via the
+  auto-rtsp flag.
 - **Offline repro refreshed (2026-08-27)**: the tree's
   `src/ByteStreamFifoSource.cpp` had been byte-identical to upstream —
   missing the heartbeat poll, 1 MB F_SETPIPE_SZ growth, drain-keep-
