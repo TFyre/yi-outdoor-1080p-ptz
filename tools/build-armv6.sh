@@ -96,13 +96,14 @@ build_rtspserver() {
     cp "$REPO/tools/vendor/ByteStreamFifoSource.cpp" "$LIVE/src/"
     cp "$REPO/tools/vendor/RTPInterface.cpp" "$LIVE/liveMedia/"
     cp "$REPO/tools/vendor/MultiFramedRTPSink.cpp" "$LIVE/liveMedia/"
+    cp "$REPO/tools/vendor/H264or5VideoStreamFramer.cpp" "$LIVE/liveMedia/"
     sed -i 's/fFrameRate = 30.0/fFrameRate = 20.0/' "$LIVE/liveMedia/H264or5VideoStreamFramer.cpp"
     # musl 32-bit ARM: time_t is 64-bit; the upstream %ld printf reads only
     # 32 bits, misaligning every subsequent vararg and crashing sprintf.
     sed -i 's/o=- %ld%06ld %d IN IP4/o=- %lld%06lld %d IN IP4/' "$LIVE/liveMedia/ServerMediaSession.cpp"
 
     cat > "$LIVE/config.linux-cross" <<'EOF'
-COMPILE_OPTS =		$(INCLUDES) -I. -O1 -ffunction-sections -fdata-sections -DSOCKLEN_T=socklen_t -D_LARGEFILE_SOURCE=1 -D_FILE_OFFSET_BITS=64 -DNO_OPENSSL=1 -DRTP_PAYLOAD_MAX_SIZE=1352 -DNEWLOCALE_NOT_USED -DALLOW_RTSP_SERVER_PORT_REUSE=1
+COMPILE_OPTS =		$(INCLUDES) -I. -O1 -ffunction-sections -fdata-sections -DSOCKLEN_T=socklen_t -D_LARGEFILE_SOURCE=1 -D_FILE_OFFSET_BITS=64 -DNO_OPENSSL=1 -DPRES_TIME_CLOCK=1 -DRTP_PAYLOAD_MAX_SIZE=1352 -DNEWLOCALE_NOT_USED -DALLOW_RTSP_SERVER_PORT_REUSE=1
 C =			c
 C_COMPILER =		$(CC)
 C_FLAGS =		$(COMPILE_OPTS) $(CPPFLAGS) $(CFLAGS)

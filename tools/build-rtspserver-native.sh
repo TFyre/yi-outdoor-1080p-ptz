@@ -19,6 +19,7 @@ cp "$REPO/tools/vendor/ByteStreamFifoSource.hh" "$LIVE/liveMedia/include/"
 cp "$REPO/tools/vendor/ByteStreamFifoSource.cpp" "$LIVE/src/"
 cp "$REPO/tools/vendor/RTPInterface.cpp" "$LIVE/liveMedia/"
 cp "$REPO/tools/vendor/MultiFramedRTPSink.cpp" "$LIVE/liveMedia/"
+cp "$REPO/tools/vendor/H264or5VideoStreamFramer.cpp" "$LIVE/liveMedia/"
 
 rm -rf "$SRC/live-host"
 cp -r "$SRC/live" "$SRC/live-host"
@@ -27,6 +28,13 @@ cd "$SRC/live-host"
 # The camera's fifo path is held by a stale root-owned process in WSL;
 # the repro feeds /tmp/h264_fifo2 instead. Native-only change.
 sed -i 's|/tmp/h264_high_fifo|/tmp/h264_fifo2|' src/rRTSPServer.cpp
+
+# Wall-clock presentation times (A/V sync) - the armv6 build bakes the
+# same define into config.linux-cross, but this repro may run first (or
+# against a config generated before the define existed); add it only if
+# missing so the sed stays idempotent.
+grep -q PRES_TIME_CLOCK config.linux-cross 2>/dev/null || \
+    sed -i 's/-DNO_OPENSSL=1/-DNO_OPENSSL=1 -DPRES_TIME_CLOCK=1/' config.linux-cross 2>/dev/null || true
 
 ./genMakefiles linux-cross >/dev/null 2>&1
 rm -f Makefile && cp "$SRC/Makefile.rRTSPServer" Makefile

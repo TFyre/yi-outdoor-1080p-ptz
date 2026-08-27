@@ -281,17 +281,39 @@ through whole to `/tmp/aac_audio_fifo` (filter 0x0100, no chain gate,
 cursor seeded 0 with the live-edge jump, purger trim 16 KB). The server
 needs no changes: ADTSAudioFifoSource parses the ADTS header for the
 SDP config ("1408"), strips it per frame, and MPEG4GenericRTPSink
-payloads; the vendored MultiFramedRTPSink pacing removal also un-paces
-the audio sink while the source's 64 ms presentation-time increments
-keep the RTP timestamps right. `rtsp://10.1.2.19/ch0_2.h264` is the
-audio-only stream; ch0_0/ch0_1 interleave it. Verified offline: the
-walk's exact ADTS output decodes 0 errors, and a native server run fed
-from the fifo logged "profile 1 … 16000 … channel_configuration 1" with
-a clean ffmpeg RTSP capture. Offline repro for audio: `analysis/audio_probe.py`
+payloads. `rtsp://10.1.2.19/ch0_2.h264` is the audio-only stream;
+ch0_0/ch0_1 interleave it. Verified offline: the walk's exact ADTS
+output decodes 0 errors, and a native server run fed from the fifo
+logged "profile 1 … 16000 … channel_configuration 1" with a clean
+ffmpeg RTSP capture. Offline repro for audio: `analysis/audio_probe.py`
 (snapshot record stats) and a WSL x86 `fshare2fifo -a -n -o out.aac` on
 a snapshot copied to `/dev/shm/fshare_frame_buf` (the -n budget must be
 ≤ the records available — on a static snapshot video -n hangs waiting
 for records that never come).
+
+**A/V sync (2026-08-27)**: the interleaved stream desynced because the
+two substreams carried DIFFERENT clocks. The video framer's
+`setPresentationTime()` stamps a free-running counter advanced by
+1/fFrameRate (20 fps) per access unit — with the true source rate at
+~19.5 fps the video RTP clock ran 2.5% slow (video lags ~1.5 s per
+minute); the audio source's count-based 64 ms/frame increments tracked
+real time. Fix: both sides stamp the WALL CLOCK — the vendored
+`tools/vendor/H264or5VideoStreamFramer.cpp` replaces the counter
+advance with `gettimeofday` per access unit, and
+`-DPRES_TIME_CLOCK=1` (in `config.linux-cross`, both build scripts)
+makes ADTSAudioFifoSource do the same. Verified with
+`tools/avsync-test.sh` (both fifos fed at their real rates, ch0_0
+captured, pts spans compared): span ratio 1.0001, 0.0 s of video lag
+per 60 s (was 0.975 by construction). While building that repro a
+real server bug surfaced and was fixed: the vendored
+ByteStreamFifoSource's delayed-task heartbeat (retryRead) outlived the
+source in the DESCRIBE dummy-sink flow (`sdpLines()` deletes the source
+right after `getAuxSDPLine()`) and fired on the freed heap chunk —
+SIGSEGV on every client DESCRIBE in the repro (watchpoint evidence:
+`strDup` of the audio SDP lines into the freed chunk). The heartbeat
+and the EAGAIN retry task are REMOVED — the stall they guarded was the
+sink pacing (560f6c3), and the level-triggered fifo handler re-signals
+on its own.
 
 **Known remaining issue**: in the hyperactive eras (~600 KB-1 MB/s
 bursts; the ring laps every ~3 s) the NAL-mode walk still churns on

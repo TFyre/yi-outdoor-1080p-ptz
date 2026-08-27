@@ -178,6 +178,10 @@ ByteStreamFifoSource::ByteStreamFifoSource(UsageEnvironment& env, FILE* fid,
 }
 
 ByteStreamFifoSource::~ByteStreamFifoSource() {
+    /* No delayed tasks are armed anymore, but unschedule defensively
+     * in case a future change re-adds one. */
+    envir().taskScheduler().unscheduleDelayedTask(nextTask());
+    nextTask() = NULL;
     delete[] fPendingData;
     if (fTee != NULL) fclose(fTee);
     if (fFid == NULL) return;
@@ -210,23 +214,23 @@ void ByteStreamFifoSource::doGetNextFrame() {
                (TaskScheduler::BackgroundHandlerProc*)&fileReadableHandler, this);
         fHaveStartedReading = True;
     }
-    // Heartbeat poll: a missed readable transition on the fifo would
-    // otherwise leave the server idle with a full fifo while the
-    // producer drops everything and the client starves - the observed
-    // mid-stream freeze (ffplay: frames stop, vq=0KB, the session stays
-    // open). The poll re-arms on every doGetNextFrame while data is
-    // awaited, so no lost wakeup can stall the stream for longer than
-    // one poll period.
-    if (nextTask() == NULL) {
-        nextTask() = envir().taskScheduler().scheduleDelayedTask(
-            200000, (TaskFunc*)&retryRead, this);
-        if (debug & 4) fprintf(stderr, "src: getnext armed hb\n");
-    }
+    /* NOTE: there used to be a delayed-task "heartbeat poll" here
+     * (retryRead, armed every 200 ms) to recover from missed readable
+     * transitions. It was REMOVED: the task outlived the source in the
+     * DESCRIBE dummy-sink flow - OnDemandServerMediaSubsession::
+     * sdpLines() deletes the source right after getAuxSDPLine(), and a
+     * still-armed retryRead then fired on the freed heap chunk
+     * (reused by the audio SDP strDup in the same request) - SIGSEGV
+     * on every client DESCRIBE in the offline A/V repro. The stall the
+     * heartbeat guarded was actually the sink pacing (560f6c3); the
+     * background handler is level-triggered and is re-registered by
+     * every doGetNextFrame, so a full fifo re-signals on its own. */
 #endif
 }
 
 void ByteStreamFifoSource::doStopGettingFrames() {
     envir().taskScheduler().unscheduleDelayedTask(nextTask());
+    nextTask() = NULL;   /* the token is dead after the unschedule */
 #ifndef READ_FROM_FILES_SYNCHRONOUSLY
     envir().taskScheduler().disableBackgroundHandling(fileno(fFid));
     fHaveStartedReading = False;
@@ -239,21 +243,6 @@ void ByteStreamFifoSource::fileReadableHandler(ByteStreamFifoSource* source, int
       return;
     }
     source->doReadFromFile();
-}
-
-void ByteStreamFifoSource::retryRead(ByteStreamFifoSource* source) {
-    // Periodic fallback for the background handler, armed by
-    // doGetNextFrame: a missed readable transition on the fifo leaves
-    // the server idle with a full fifo and the producer blocked in
-    // pipe_wait (the stream stalls until another client's drain shakes
-    // it loose). The EAGAIN path in doReadFromFile also chains this
-    // task every 100 ms while the fifo is empty; the heartbeat covers
-    // the transitions the handler itself misses.
-    source->nextTask() = NULL;
-    if (source->isCurrentlyAwaitingData())
-        source->doReadFromFile();
-    else if (debug & 4)
-        fprintf(stderr, "src: retry fired, not awaiting\n");
 }
 
 void ByteStreamFifoSource::doReadFromFile() {
@@ -299,11 +288,11 @@ void ByteStreamFifoSource::doReadFromFile() {
             }
             if (n < 0) {
                 if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                    /* fifo momentarily empty: also arm the polling retry
-                     * (see retryRead) so a missed handler transition
-                     * cannot stall the stream */
-                    nextTask() = envir().taskScheduler().scheduleDelayedTask(
-                        100000, (TaskFunc*)&retryRead, this);
+                    /* fifo momentarily empty: just wait for the next
+                     * readable event (the producer writes constantly,
+                     * so the level-triggered handler re-signals). No
+                     * delayed task here - it outlived the source and
+                     * crashed on freed memory (see doGetNextFrame). */
                     return;
                 }
                 handleClosure();
