@@ -2,10 +2,30 @@
 # Native (x86_64) build of rRTSPServer for debugging under gdb in WSL.
 set -e
 
-SRC=/mnt/c/myprogs/yi-outdoor-1080p-ptz/analysis/upstream-yi-hack-v5/src/rRTSPServer
+REPO=/mnt/c/myprogs/yi-outdoor-1080p-ptz
+SRC=$REPO/analysis/upstream-yi-hack-v5/src/rRTSPServer
+LIVE=$SRC/live
+
+# Re-apply the vendored fixes into the tree first - the same step the
+# armv6 build does. The tree's src/ files can lag tools/vendor (the
+# repro has run a stale upstream ByteStreamFifoSource before: no
+# heartbeat poll, 64 KB fifo, blind drain - divergent from the deployed
+# server), so this keeps the repro honest about what the camera runs.
+cp "$REPO/tools/vendor/H264VideoFifoServerMediaSubsession.hh" "$LIVE/liveMedia/include/"
+cp "$REPO/tools/vendor/H264VideoFifoServerMediaSubsession.cpp" "$LIVE/src/"
+cp "$REPO/tools/vendor/ADTSAudioStreamDiscreteFramer.hh" "$LIVE/liveMedia/include/"
+cp "$REPO/tools/vendor/ADTSAudioStreamDiscreteFramer.cpp" "$LIVE/liveMedia/"
+cp "$REPO/tools/vendor/ByteStreamFifoSource.hh" "$LIVE/liveMedia/include/"
+cp "$REPO/tools/vendor/ByteStreamFifoSource.cpp" "$LIVE/src/"
+cp "$REPO/tools/vendor/RTPInterface.cpp" "$LIVE/liveMedia/"
+
 rm -rf "$SRC/live-host"
 cp -r "$SRC/live" "$SRC/live-host"
 cd "$SRC/live-host"
+
+# The camera's fifo path is held by a stale root-owned process in WSL;
+# the repro feeds /tmp/h264_fifo2 instead. Native-only change.
+sed -i 's|/tmp/h264_high_fifo|/tmp/h264_fifo2|' src/rRTSPServer.cpp
 
 ./genMakefiles linux-cross >/dev/null 2>&1
 rm -f Makefile && cp "$SRC/Makefile.rRTSPServer" Makefile
@@ -14,5 +34,8 @@ sed -i 's|$(LIBRARY_LINK)$@|$(LIBRARY_LINK) $@|' \
     UsageEnvironment/Makefile BasicUsageEnvironment/Makefile
 make clean >/dev/null 2>&1 || true   # drop stale cross-compiled objects
 rm -f src/*.o                       # the clean target misses the wrapper objs
-make -j4 CC=gcc CXX=g++ 2>&1 | tail -3
+# NOTE: no -j; rRTSPServer's prereq check races the livemedia target
+# (same as the armv6 build) - a -j4 link starts before libliveMedia.a
+# is finished and fails with undefined symbols.
+make CC=gcc CXX=g++ CFLAGS="-O0 -g" CXXFLAGS="-O0 -g" 2>&1 | tail -3
 ls -la rRTSPServer
