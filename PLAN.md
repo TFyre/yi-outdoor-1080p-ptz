@@ -28,27 +28,56 @@ This is the live plan. The user drives each step; nothing here is auto-approved.
    built (ARMv6-clean) and deployed to the SD. The user's
    watcher-supervised chain (if still up) is already running the fixed
    binary — a respawn after the deploy picked it up.
-3. **Next: fetch 60 s of the producer's emission for the user to view.**
-   - Dump on the camera, detached so an ssh drop can't kill it:
+3. **DONE (2026-08-27): 60 s dump captured on a clean platform.** First
+   the auto-start was disabled (section below), then the camera was
+   rebooted on the user's order so no debug leftovers could pollute the
+   capture. Post-boot verified clean: no chain processes, no feeder, no
+   fifo; ring flowing (seq +43/s). The dump ran detached:
      ```
-     ssh ... root@10.1.2.19 'rm -f /tmp/cap60b.h264; (nohup timeout 60 /tmp/sd/hack/bin/fshare2fifo -o /tmp/cap60b.h264 > /tmp/dump60b.log 2>&1 &)'
+     ssh ... root@10.1.2.19 'rm -f /tmp/cap60b.h264; (nohup timeout 60 /tmp/sd/hack/bin/fshare2fifo -o /tmp/cap60b.h264 </dev/null > /tmp/dump60b.log 2>&1 &)'
      ```
-     (`-o` writes the walk's exact emission; SIGTERM handler flushes
-     cleanly. The dump reads the ring directly — it does NOT touch the
-     fifo, the server, or the chain's producer; it just claims a second
-     reader slot, which the protocol supports.)
-   - Wait ~65 s, then check `ls -l /tmp/cap60b.h264` (~120 KB/s × 60 s ≈
-     7 MB). A previous dump attempt may have left a partial
-     `/tmp/cap60b.h264` or none — re-run the command if the file is
-     missing or small. Do not disturb the running chain.
-   - Copy down: pipe over ssh into `analysis/cap60.h264` (gitignored):
-     ```
-     ssh ... 'cat /tmp/cap60b.h264' > analysis/cap60.h264
-     ```
-   - Tell the user where it is. They play it with ffplay. No
-     auto-verification.
-4. Wait for the user's verdict. Do not proceed to the RTSP work until
-   they are happy with the file.
+     (`</dev/null` makes ssh return immediately — without it the
+     nohup'd child keeps the session channel open until its 60 s
+     timeout. `-o` writes the walk's exact emission; the SIGTERM
+     handler flushed cleanly: log "slot 10 claimed (filter 0x0400,
+     cursor 29058) / slot 10 released". The dump reads the ring
+     directly — it does NOT touch the fifo, the server, or the chain's
+     producer; it just claims a second reader slot, which the protocol
+     supports.)
+   - Copied down to `analysis/cap60.h264` (gitignored): **8,924,017
+     bytes, md5 8e270ef54c62a2d08b8f6b3aad0ffcf5** (camera+local match,
+     ~148 KB/s). The user plays it with ffplay.
+4. Settled (2026-08-27): the user's 30 s movement capture
+   (`cap60tfyre.h264`, 599 NALs) and the 60 s static capture
+   (`analysis/cap60.h264`, 1162 NALs) both show the source at
+   ~19.5 fps — the record-era hi-res stream really runs ~19-20 fps,
+   NOT the documented 15 fps. Nothing was missing: the "fast OSD" was
+   the playback filter forcing a higher FRAME_RATE than the source
+   (30 s of camera time in 20 s of playback = 1.5×). For 1:1 viewing,
+   play with `-framerate 20` or `setpts=N/20/TB`.
+   While verifying, a REAL bug surfaced: mid-uptime the app's writer
+   moved the record magic prefix from 0x6a8x to 0x6a90 (era drift;
+   format unchanged — offline parse of `analysis/ring-era90.bin`
+   shows 26-byte headers, exact stride arithmetic, consecutive seq).
+   `magic_ok()` accepted only 0x6a80..0x6a8f, so the walk rejected
+   every record of the new era: cursor pinned, 0 emission for as long
+   as the era lasted (AGELOG: nals=0 while seq marched +41/s). Fixed:
+   `magic_ok` now accepts any 0x6aXX family — the torn-record
+   protection is the len/type/seq/next-magic cascade that follows the
+   gate, so era drift can never stall the walk again. Rebuilt
+   ARMv6-clean, deployed (md5-checked), verified live: emission
+   resumed at 16-20 nals/s, drops=0, cursor tracks seq within 2.
+   Primary objective verdict: emission is clean AND complete
+   (drops=0, full source rate, quality great per the user). Awaiting
+   the user's OK to move to the RTSP stall work.
+
+## Auto-start of the RTSP chain is now OPT-IN (2026-08-27)
+
+`hack/boot.sh` gates the `start-rtsp.sh` spawn behind a flag file:
+create `/tmp/sd/hack/auto-rtsp` (any content) to bring the chain up at
+boot; without it boot leaves the chain down, and it is started by hand
+with `sh /tmp/sd/hack/start-rtsp.sh`. Deployed to the SD (md5-checked
+match with `deploy/hack/boot.sh`). The chain is currently DOWN.
 
 ## Secondary objective (BLOCKED on the primary): the RTSP server stall
 
@@ -94,6 +123,18 @@ Current understanding when we return to it:
   and a detached `fshare2fifo -o` dump. Check `/proc/*/cmdline` before
   touching anything; clean up ONLY what the user approves. Do not run
   anything that can block (e.g. a raw `cat > fifo` without a reader).
+- Ctrl+C on the dump is SAFE: the deployed fshare2fifo handles
+  SIGINT/SIGTERM (on_term → stop_flag → release_slot; seen as "slot 10
+  released" in dump logs). The camera reboot the user saw right after a
+  Ctrl+C was the known spontaneous-reboot flakiness (stressed movement
+  era), not the dump — v2 touches no app semaphores/futexes. nohup
+  itself only ignores SIGHUP (session close); if the dump also ran with
+  `&`, Ctrl+C simply never reached it.
+- Windows ssh can wedge probing the local SSH agent: every camera
+  command hangs with no output while ping and dropbear stay healthy
+  (`ssh -vv` stops right after "Next authentication method: publickey").
+  Add `-o IdentityAgent=none` to the ssh command — the key is given
+  with `-i` anyway. (Hit 2026-08-27; cost a lot of dead time.)
 - Kill-scan footgun: `grep -q start-rtsp /proc/*/cmdline` kills YOUR OWN
   remote shell (its command line contains the pattern). Use bracket
   patterns that don't self-match (e.g. `start[-]rtsp`, `feed[.]h264`)
