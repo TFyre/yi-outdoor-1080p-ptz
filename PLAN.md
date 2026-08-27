@@ -111,29 +111,39 @@ server's parse/sink chain — the only suspect left, matching the
 hypotheses below.
 
 
-Current understanding when we return to it:
+**RESOLVED (2026-08-27, commit 560f6c3) — the stall was TWO server bugs,
+found with strace+gdb on the offline repro:**
 
-- **Symptom**: any client (ffplay/ffmpeg) gets a ~400–600 KB burst
-  (~2–4 s of stream: 4 chains + ~50 P slices), then nothing. The TCP
-  session stays ESTABLISHED, Send-Q stays 0, the client just starves.
-- **Producer side is exonerated**: ring flows (~56 records/s), our slot
-  cursor tracks newest (caught up), the reader emits 15–20 NALs/s ≈
-  150 KB/s, drops=0. Reproduced with a clean-bytes feeder (no producer
-  at all) → the bytes/parser/sink chain on the SERVER is at fault.
-- **Server log signature** (run with `rRTSPServer -d 4`, log goes to
-  `/tmp/rtsp.log`): a few `src: read n=... fill=... awaiting=1` lines
-  (reads capped at 150,000 = the live555 parser's BANK_SIZE), 6–8 s
-  gaps between reads, then `src: retry fired, not awaiting` forever —
-  the sink/framer/parser chain stops requesting the source.
-- **Ruled out**: truncation (`OutPacketBuffer::maxSize` is already
-  262144 in rRTSPServer.cpp:319; the client receives full 76 KB IDRs);
-  blocked sends (Send-Q 0); pacing (playTimePerFrame=0 → fDuration=0);
-  writer-gap EOF (the feeder test kept the fifo full with no gaps).
-- **Open hypotheses**: (a) the parser wedges mid-NAL across the 150 KB
-  bank boundary (the tee ended 26 KB into a 60 KB IDR); (b) something
-  in the live555 H264or5VideoStreamParser state machine stalls on this
-  era's NAL pattern (double synthesized SPS, 4-byte PPS, AUDs before
-  slices). Not yet pinpointed.
+- **Bug 1 — the sink paced every NAL.** `MultiFramedRTPSink::
+  afterGettingFrame1` advances `fNextSendTime` by the frame's duration,
+  with a 66667 us PER-NAL fallback when the duration is 0. The
+  subsession's `playTimePerFrame=0` never reached the sink — the
+  FRAMER recomputes `fDurationInMicroseconds` from its own fFrameRate
+  — so the earlier "pacing ruled out" was based on zeroing the wrong
+  knob. Measured: duration=0 at the sink → 15 NALs/s cap against a
+  ~19.5 fps source → the fifo fills, the producer's whole-or-drop
+  kicks in, clients see a burst then a frozen stream. The 6–8 s read
+  gaps were the sink trickling through a 150 KB parser bank. Fixed:
+  `MultiFramedRTPSink.cpp` vendored with the advance removed — a live
+  fifo source IS the clock; every packet goes out immediately.
+- **Bug 2 — the RTPInterface drop killed healthy clients.** The
+  vendored drop-on-any-partial-send fired on the first EAGAIN of an
+  unpaced burst (the drain-kept chain alone is ~90 KB back-to-back):
+  one 1076-byte packet partially sent → the client's whole RTP stream
+  was removed → "burst then nothing" with the session still
+  ESTABLISHED and Send-Q 0 — exactly the camera signature (gdb caught
+  it: `sendDataOverTCP: send buffer full (324 of 1352 bytes sent)`).
+  Fixed: bounded poll-writable retry (500 ms budget) to complete the
+  packet; only a genuinely stalled client (budget expiry) gets
+  dropped — preserving the 6f7b205 intent (never wedge the event
+  loop) without killing healthy streams.
+- Repro verification: 45 s capture, **9.08 MB at full source rate,
+  0 drops** (was: 1.4 MB then the drop). The refreshed repro (1 MB
+  fifo + drain-keep-chain + heartbeat) never showed the old "reads
+  stop forever" pattern — the pacing+trickle was its whole stall.
+- Pending: rebuild the armv6 binary, deploy to the SD, start the
+  chain (user-driven) and verify live that the camera client streams
+  continuously.
 - **Offline repro refreshed (2026-08-27)**: the tree's
   `src/ByteStreamFifoSource.cpp` had been byte-identical to upstream —
   missing the heartbeat poll, 1 MB F_SETPIPE_SZ growth, drain-keep-
