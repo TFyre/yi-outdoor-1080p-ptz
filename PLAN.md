@@ -81,27 +81,27 @@ match with `deploy/hack/boot.sh`). The user enabled the flag after the
 live verification: the chain now comes up automatically at every boot
 and the watcher keeps it up.
 
-## Next item (IN PROGRESS): survive ring mode flips
+## Next item (DONE 2026-08-27): survive ring mode flips
 
-The ring switches MID-UPTIME between the record-framed mode (the v2
-walk's native format) and the raw Annex-B mode (documented in
-CLAUDE.md's ring-format section; verified live pre-v2: the c0 entries
-vanish while the encoder keeps running). The v2 walk is record-only —
-it has NO raw-mode fallback (the whole v1 machinery was deleted in
-d34df8c) — so a flip to raw mode would silence the producer exactly
-like the magic-era flip did, until records return. Today's magic-era
-fix handled the prefix drift; the mode flip itself is still open.
+Investigation first: all 52 ring snapshots in `analysis/` (s*.bin,
+rs*.bin, ring_*.bin, era90, Aug 23-27) are RECORD-framed — magic
+density 7,200-9,500 per ring, start-code and c0 counts at noise level.
+Raw Annex-B mode has never been captured on this firmware; the pre-v2
+raw-mode notes describe the pre-record era. A full raw NAL-walk
+fallback would therefore be speculative.
 
-Plan:
-1. Establish whether raw mode still occurs on this firmware: watch the
-   live ring for record-magic density over hours (a low-frequency
-   sampler), and re-examine the old `analysis/s*.bin` snapshots.
-2. If it occurs: add a fallback to the v2 walk — detect "records
-   stale while the ring flows" (pending silent, valid/seq advancing),
-   then either resume the record walk when records return or switch to
-   a simplified raw Annex-B NAL walk (recover the v1 walk's essentials
-   from git history rather than its full diff-sampler machinery).
-3. Rebuild, deploy, verify (offline repro first, then live).
+What the magic-era flip (17af484) DID prove is the generic failure
+mode: ring flowing, walk silent, no error. That is now guarded by the
+stall watchdog (9549191): no record consumed for 15 s while HDR_VALID
+moves -> re-anchor the cursor at the newest seq; four consecutive
+re-anchors with no records -> exit and let start-rtsp.sh's watcher
+respawn with a fresh claim. A static ring never triggers it. Built
+ARMv6-clean, deployed (md5-checked), verified live (AGELOG dump:
+cursor tracking, 16 nals/s, drops=0).
+
+Note: the running chain keeps the old producer inode until the next
+respawn/reboot; the watchdog binary activates on the next natural
+restart (auto-rtsp is enabled, so the next boot brings it up).
 
 ## Secondary objective (primary settled 2026-08-27): the RTSP server stall
 
