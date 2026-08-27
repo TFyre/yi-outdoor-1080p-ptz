@@ -78,6 +78,14 @@
 #define NAL_BUF_MAX 256          /* SPS/PPS are tiny */
 #define DEFAULT_FIFO "/tmp/h264_high_fifo"
 
+/* Stall watchdog (see reader_loop): ring flowing (valid moves) but no
+ * record consumed for STALL_SECS -> re-anchor the cursor at the newest
+ * seq; after MAX_STALL_REANCHOR consecutive re-anchors with nothing
+ * consumed, exit and let start-rtsp.sh's watcher respawn us with a
+ * fresh claim. */
+#define STALL_SECS 15
+#define MAX_STALL_REANCHOR 4
+
 static volatile uint8_t *buf;      /* mmap of the shared buffer */
 static size_t buf_size;
 static int slot_k = -1;            /* our reader slot */
@@ -87,6 +95,8 @@ static FILE *out;                  /* file output (-o FILE) */
 static int out_fd = -1;            /* fifo output, non-blocking */
 static size_t g_pipe_size = 256 * 1024;
 static volatile int stop_flag;
+static void release_slot(void);   /* defined below reader_loop; the
+                                   * stall watchdog calls it */
 
 /* ---- diagnostics ---- */
 static int f2f_trace(void)  { return getenv("F2F_TRACE") != NULL; }
@@ -677,6 +687,10 @@ static void reader_loop(void)
     static uint16_t cur_type;
     time_t next_log = 0;
     unsigned budget = 256;             /* -n one-shot budget */
+    /* Stall watchdog state: "ring flowing but nothing consumed" */
+    time_t last_emit = 0;
+    uint32_t last_valid = 0;
+    int stall_anchors = 0;
 
     payload = malloc(MAXPAY);
     if (!payload) {
@@ -765,6 +779,45 @@ static void reader_loop(void)
                 g_nals = g_bytes = g_drops = 0;
                 next_log = t + 1;
             }
+        }
+
+        /* Stall watchdog: the writer is flowing (valid moves) but we
+         * have consumed nothing for a while. Re-anchor the cursor at
+         * the newest seq - covers magic-era drift and seq-era resets
+         * the walk's own checks missed (e.g. a prefix change outside
+         * the 0x6aXX family). If consecutive re-anchors bring no
+         * records back, the ring carries no records at all (the app
+         * flipped to raw Annex-B, or a torn region never heals): exit
+         * so start-rtsp.sh's watcher respawns us with a fresh claim. */
+        if (last_emit) {
+            uint32_t v = hdr_u32(HDR_VALID);
+            if (v != last_valid) {
+                if (time(NULL) - last_emit >= STALL_SECS) {
+                    fprintf(stderr,
+                            "stall: %ld s without consuming a record while "
+                            "the ring flows (valid %u -> %u, seq %u) - "
+                            "re-anchoring\n",
+                            (long)(time(NULL) - last_emit), last_valid, v,
+                            hdr_u32(HDR_SEQ));
+                    slot_cursor = hdr_u32(HDR_SEQ);
+                    slot_wr_u32(SLOT_OFF(slot_k) + 8, slot_cursor);
+                    last_emit = time(NULL);
+                    if (++stall_anchors >= MAX_STALL_REANCHOR) {
+                        fprintf(stderr,
+                                "stall: no records after %d re-anchors - "
+                                "exiting for the watcher to respawn\n",
+                                stall_anchors);
+                        release_slot();
+                        return;
+                    }
+                }
+                last_valid = v;
+            }
+        }
+
+        if (got) {
+            last_emit = time(NULL);
+            stall_anchors = 0;
         }
 
         if (!got) {
