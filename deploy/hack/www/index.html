@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>YI Outdoor — PTZ</title>
+<style>
+  :root { color-scheme: dark; }
+  body { background: #14161a; color: #dde3ea; font-family: system-ui, sans-serif;
+         max-width: 26rem; margin: 2rem auto; padding: 0 1rem; }
+  h1 { font-size: 1.2rem; font-weight: 600; }
+  a { color: #7ab0ff; }
+  .pad { display: grid; grid-template: repeat(3, 4rem) / repeat(3, 4rem);
+         gap: .5rem; justify-content: center; margin: 1.5rem 0; }
+  .pad button { font-size: 1.3rem; background: #242a33; color: #dde3ea;
+                border: 1px solid #39424f; border-radius: .6rem; cursor: pointer; }
+  .pad button:active { background: #39424f; }
+  .pad .center { background: #181c22; color: #8a93a0; font-size: .8rem; cursor: default; }
+  .snap { display: block; width: 100%; border-radius: .6rem; margin: 1rem 0; }
+  .row { display: flex; gap: .5rem; justify-content: center; }
+  .row button { background: #242a33; color: #dde3ea; border: 1px solid #39424f;
+                border-radius: .6rem; padding: .6rem 1rem; cursor: pointer; }
+  #status { text-align: center; color: #8a93a0; min-height: 1.4rem; font-size: .9rem; }
+</style>
+</head>
+<body>
+<h1>YI Outdoor PTZ</h1>
+<div class="pad">
+  <span></span><button data-dir="up">&#9650;</button><span></span>
+  <button data-dir="left">&#9664;</button>
+  <span class="center">home</span>
+  <button data-dir="right">&#9654;</button>
+  <span></span><button data-dir="down">&#9660;</button><span></span>
+</div>
+<div class="row">
+  <button id="stop">stop</button>
+  <button id="snap">snapshot</button>
+  <button id="refresh">refresh</button>
+</div>
+<p id="status"></p>
+<img id="img" class="snap" alt="snapshot" src="/cgi-bin/snapshot.cgi" onerror="this.style.display='none'">
+<p>Live view (desktop player): <a href="rtsp://IP_OF_CAMERA/ch0_0.h264">rtsp://IP_OF_CAMERA/ch0_0.h264</a></p>
+<script>
+  var pad = document.querySelector('.pad');
+  var statusEl = document.getElementById('status');
+  var moving = null;
+
+  function send(dir, done) {
+    fetch('/cgi-bin/ptz.sh?dir=' + dir).then(function (r) {
+      return r.text();
+    }).then(function () {
+      statusEl.textContent = dir + (done ? '' : ' (held)');
+      if (done) moving = null;
+    }).catch(function () {
+      statusEl.textContent = 'command failed';
+      moving = null;
+    });
+  }
+
+  pad.addEventListener('pointerdown', function (e) {
+    var b = e.target.closest('button[data-dir]');
+    if (!b) return;
+    moving = b.dataset.dir;
+    send(b.dataset.dir, false);
+  });
+  pad.addEventListener('pointerup', function () {
+    if (moving) send('stop', true);
+  });
+  document.getElementById('stop').onclick = function () { send('stop', true); };
+  document.getElementById('snap').onclick = function () {
+    document.getElementById('img').style.display = '';
+    document.getElementById('img').src = '/cgi-bin/snapshot.cgi?' + Date.now();
+  };
+  document.getElementById('refresh').onclick = function () {
+    document.getElementById('img').style.display = '';
+    document.getElementById('img').src = '/cgi-bin/snapshot.cgi?' + Date.now();
+  };
+</script>
+</body>
+</html>

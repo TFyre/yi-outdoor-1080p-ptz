@@ -149,14 +149,22 @@ EOF
     ls -la rRTSPServer
 }
 
+build_ptz() {
+    cd "$REPO/src/ptz"
+    ${CROSS}-gcc $FLAGS -Wall -o ptz ptz.c -lrt
+    verify_armv6 ptz
+    ls -la ptz
+}
+
 case "$TARGET" in
     fshare2fifo) build_fshare2fifo ;;
     rtspserver)  build_rtspserver ;;
+    ptz)         build_ptz ;;
     ringcapture) build_ringcapture ;;
     slotprobe)   build_slotprobe ;;
     endprobe)    build_endprobe ;;
     scanprobe)   build_scanprobe ;;
     captimeline) build_captimeline ;;
-    all)         build_fshare2fifo; build_ringcapture; build_slotprobe; build_endprobe; build_scanprobe; build_captimeline; build_rtspserver ;;
-    *) echo "usage: $0 <fshare2fifo|ringcapture|rtspserver|all>"; exit 1 ;;
+    all)         build_fshare2fifo; build_ptz; build_ringcapture; build_slotprobe; build_endprobe; build_scanprobe; build_captimeline; build_rtspserver ;;
+    *) echo "usage: $0 <fshare2fifo|rtspserver|ptz|ringcapture|all>"; exit 1 ;;
 esac
