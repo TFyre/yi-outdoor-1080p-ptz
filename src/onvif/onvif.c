@@ -543,6 +543,43 @@ static void rsp_ptz_svc_caps(int fd)
     http_reply(fd, g_resp);
 }
 
+/* media + device service capabilities: real clients (HA) probe both */
+static void rsp_media_svc_caps(int fd)
+{
+    snprintf(g_resp, sizeof(g_resp),
+             ENV_HEAD
+             "<trt:GetServiceCapabilitiesResponse><trt:Capabilities>"
+             "<tt:ProfileCapabilities><tt:MaximumNumberOfProfiles>1"
+             "</tt:MaximumNumberOfProfiles></tt:ProfileCapabilities>"
+             "<tt:StreamingCapabilities><tt:RTPMulticast>false"
+             "</tt:RTPMulticast><tt:RTP_TCP>true</tt:RTP_TCP>"
+             "<tt:RTP_RTSP_TCP>true</tt:RTP_RTSP_TCP></tt:StreamingCapabilities>"
+             "</trt:Capabilities></trt:GetServiceCapabilitiesResponse>"
+             ENV_TAIL);
+    http_reply(fd, g_resp);
+}
+
+static void rsp_device_svc_caps(int fd)
+{
+    snprintf(g_resp, sizeof(g_resp),
+             ENV_HEAD
+             "<tds:GetServiceCapabilitiesResponse><tds:Capabilities>"
+             "<tds:Network><tt:IPFilter>false</tt:IPFilter>"
+             "<tt:ZeroConfiguration>false</tt:ZeroConfiguration>"
+             "<tt:IPVersion6>false</tt:IPVersion6>"
+             "<tt:DynDNS>false</tt:DynDNS></tds:Network>"
+             "<tds:System><tt:DiscoveryResolve>false</tt:DiscoveryResolve>"
+             "<tt:DiscoveryBye>false</tt:DiscoveryBye>"
+             "<tt:RemoteDiscovery>false</tt:RemoteDiscovery>"
+             "<tt:SystemBackup>false</tt:SystemBackup>"
+             "<tt:SystemLogging>false</tt:SystemLogging>"
+             "<tt:FirmwareUpgrade>false</tt:FirmwareUpgrade>"
+             "</tds:System>"
+             "</tds:Capabilities></tds:GetServiceCapabilitiesResponse>"
+             ENV_TAIL);
+    http_reply(fd, g_resp);
+}
+
 /* ---- request routing ---- */
 static int handle_request(int fd)
 {
@@ -614,6 +651,10 @@ static int handle_request(int fd)
         rsp_ptz_configurations(fd);
     else if (ACT_SUFFIX("/ptz/wsdl/", "GetServiceCapabilities"))
         rsp_ptz_svc_caps(fd);
+    else if (ACT_SUFFIX("/media/wsdl/", "GetServiceCapabilities"))
+        rsp_media_svc_caps(fd);
+    else if (ACT_SUFFIX("/device/wsdl/", "GetServiceCapabilities"))
+        rsp_device_svc_caps(fd);
     else {
         fprintf(stderr, "onvif: FAULT for %s\n", action ? action : "(no SOAPAction)");
         http_fault(fd, "method not implemented");
