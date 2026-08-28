@@ -580,6 +580,54 @@ static void rsp_device_svc_caps(int fd)
     http_reply(fd, g_resp);
 }
 
+/* the service directory: clients (HA) use GetServices to locate the
+ * PTZ service - without it they never reach PTZ at all */
+static void rsp_services(int fd)
+{
+    snprintf(g_resp, sizeof(g_resp),
+             ENV_HEAD
+             "<tds:GetServicesResponse>"
+             "<tds:Service>"
+             "<tds:Namespace>http://www.onvif.org/ver10/device/wsdl</tds:Namespace>"
+             "<tds:XAddr>%s/onvif/device_service</tds:XAddr>"
+             "<tds:Version><tt:Major>2</tt:Major><tt:Minor>6</tt:Minor></tds:Version>"
+             "</tds:Service>"
+             "<tds:Service>"
+             "<tds:Namespace>http://www.onvif.org/ver10/media/wsdl</tds:Namespace>"
+             "<tds:XAddr>%s/onvif/media_service</tds:XAddr>"
+             "<tds:Version><tt:Major>2</tt:Major><tt:Minor>6</tt:Minor></tds:Version>"
+             "</tds:Service>"
+             "<tds:Service>"
+             "<tds:Namespace>http://www.onvif.org/ver20/ptz/wsdl</tds:Namespace>"
+             "<tds:XAddr>%s/onvif/ptz_service</tds:XAddr>"
+             "<tds:Version><tt:Major>2</tt:Major><tt:Minor>6</tt:Minor></tds:Version>"
+             "</tds:Service>"
+             "</tds:GetServicesResponse>"
+             ENV_TAIL,
+             g_xaddr, g_xaddr, g_xaddr);
+    http_reply(fd, g_resp);
+}
+
+static void rsp_network_interfaces(int fd)
+{
+    snprintf(g_resp, sizeof(g_resp),
+             ENV_HEAD
+             "<tds:GetNetworkInterfacesResponse><tds:NetworkInterfaces "
+             "token=\"eth0\">"
+             "<tt:Enabled>true</tt:Enabled>"
+             "<tt:Info><tt:Name>eth0</tt:Name>"
+             "<tt:HwAddress>00:00:00:00:00:01</tt:HwAddress>"
+             "<tt:MTU>1500</tt:MTU></tt:Info>"
+             "<tt:IPv4><tt:Enabled>true</tt:Enabled>"
+             "<tt:Config><tt:Manual>"
+             "<tt:Address>10.1.2.19</tt:Address>"
+             "<tt:PrefixLength>24</tt:PrefixLength>"
+             "</tt:Manual></tt:Config></tt:IPv4>"
+             "</tds:NetworkInterfaces></tds:GetNetworkInterfacesResponse>"
+             ENV_TAIL);
+    http_reply(fd, g_resp);
+}
+
 /* ---- request routing ---- */
 static int handle_request(int fd)
 {
@@ -655,6 +703,10 @@ static int handle_request(int fd)
         rsp_media_svc_caps(fd);
     else if (ACT_SUFFIX("/device/wsdl/", "GetServiceCapabilities"))
         rsp_device_svc_caps(fd);
+    else if (ACT_SUFFIX("/device/wsdl/", "GetServices"))
+        rsp_services(fd);
+    else if (ACT_SUFFIX("/device/wsdl/", "GetNetworkInterfaces"))
+        rsp_network_interfaces(fd);
     else {
         fprintf(stderr, "onvif: FAULT for %s\n", action ? action : "(no SOAPAction)");
         http_fault(fd, "method not implemented");
