@@ -93,6 +93,19 @@ static int send_msg(const unsigned char *payload, size_t plen,
     return 0;
 }
 
+/* envelope direction for a command name. VERIFIED on this camera
+ * (2026-08-29, user-observed with the app's mount-flip OFF): 1=down
+ * 2=up 3=left 4=right - the vertical axis is INVERTED relative to the
+ * upstream yi-hack-v5 constants (their 1=up/2=down was the h30's). */
+static int dir_value(const char *cmd)
+{
+    if (!strcmp(cmd, "up"))    return 2;
+    if (!strcmp(cmd, "down"))  return 1;
+    if (!strcmp(cmd, "left"))  return 3;
+    if (!strcmp(cmd, "right")) return 4;
+    return 0;
+}
+
 static int cmd_move(unsigned dir)
 {
     unsigned char p[12];
@@ -161,7 +174,7 @@ static int cgi_mode(void)
         return 0;
     }
 
-    cmd_move((unsigned)dir + 1);
+    cmd_move((unsigned)dir_value(buf));
     {
         int mypid = (int)getpid();
         FILE *f = fopen("/tmp/ptz_active", "w");
@@ -220,10 +233,7 @@ int main(int argc, char **argv)
     if (i + 1 < argc)
         arg = atoi(argv[i + 1]);
 
-    if (!strcmp(cmd, "up"))       return cmd_move(1);
-    if (!strcmp(cmd, "down"))     return cmd_move(2);
-    if (!strcmp(cmd, "left"))     return cmd_move(3);
-    if (!strcmp(cmd, "right"))    return cmd_move(4);
+    if (dir_value(cmd))           return cmd_move((unsigned)dir_value(cmd));
     if (!strcmp(cmd, "stop"))     return cmd_stop();
     if (!strcmp(cmd, "add"))      return cmd_preset(0x4000, 0);
     if (!strcmp(cmd, "del"))      return cmd_preset(0x4001, arg);

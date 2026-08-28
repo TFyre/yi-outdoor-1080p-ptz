@@ -404,10 +404,16 @@ static void rsp_ptz_move(int fd, const char *body)
     }
     if (x == 0 && y == 0) {
         ptz_stop();
+        fprintf(stderr, "onvif: ContinuousMove x=%.2f y=%.2f -> STOP\n", x, y);
     } else if (x * x >= y * y) {
         ptz_move(x > 0 ? 4 : 3);   /* right : left */
+        fprintf(stderr, "onvif: ContinuousMove x=%.2f y=%.2f -> dir %u (%s)\n",
+                x, y, x > 0 ? 4 : 3, x > 0 ? "right" : "left");
     } else {
-        ptz_move(y > 0 ? 1 : 2);   /* up : down */
+        /* this camera's vertical axis is inverted: 1=down, 2=up */
+        ptz_move(y > 0 ? 2 : 1);
+        fprintf(stderr, "onvif: ContinuousMove x=%.2f y=%.2f -> dir %u (%s)\n",
+                x, y, y > 0 ? 2 : 1, y > 0 ? "up" : "down");
     }
     g_move_at = time(NULL);
     snprintf(g_resp, sizeof(g_resp),
