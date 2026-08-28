@@ -227,6 +227,24 @@ static void mk_xaddr(void)
              "10.1.2.19", g_port);   /* TODO: real address discovery */
 }
 
+/* the camera's real MAC - HA appends it to the device name */
+static char g_mac[18] = "00:00:00:00:00:01";
+
+static void mk_mac(void)
+{
+    FILE *f = fopen("/sys/class/net/wlan0/address", "r");
+    char buf[32];
+
+    if (f) {
+        if (fgets(buf, sizeof(buf), f)) {
+            size_t n = strcspn(buf, "\r\n");
+            if (n == 17)
+                memcpy(g_mac, buf, 17);
+        }
+        fclose(f);
+    }
+}
+
 /* ---- the method handlers ---- */
 static void rsp_device_information(int fd)
 {
@@ -616,7 +634,7 @@ static void rsp_network_interfaces(int fd)
              "token=\"eth0\">"
              "<tt:Enabled>true</tt:Enabled>"
              "<tt:Info><tt:Name>eth0</tt:Name>"
-             "<tt:HwAddress>00:00:00:00:00:01</tt:HwAddress>"
+             "<tt:HwAddress>%s</tt:HwAddress>"
              "<tt:MTU>1500</tt:MTU></tt:Info>"
              "<tt:IPv4><tt:Enabled>true</tt:Enabled>"
              "<tt:Config><tt:Manual>"
@@ -624,7 +642,8 @@ static void rsp_network_interfaces(int fd)
              "<tt:PrefixLength>24</tt:PrefixLength>"
              "</tt:Manual></tt:Config></tt:IPv4>"
              "</tds:NetworkInterfaces></tds:GetNetworkInterfacesResponse>"
-             ENV_TAIL);
+             ENV_TAIL,
+             g_mac);
     http_reply(fd, g_resp);
 }
 
@@ -727,6 +746,7 @@ int main(int argc, char **argv)
             g_port = atoi(argv[++i]);
     }
     mk_xaddr();
+    mk_mac();
 
     lsock = socket(AF_INET, SOCK_STREAM, 0);
     if (lsock < 0) {
