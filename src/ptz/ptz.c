@@ -12,9 +12,11 @@
  *   PRESET_GOTO = {1, type, 0x4002, 0x0001, 4, index}
  *   PRESET_ADD  = {1, type, 0x4000, 0x0001, 0}                      (16 B)
  *   PRESET_REM  = {1, type, 0x4001, 0x0001, 4, index}
- * The queue and the second-u32 type are flags until the live strace
- * confirms them (defaults: /ipc_dispatch - cloudAPI's send queue -
- * and type 8, upstream's value; dispatch's own forward used type 1).
+ * VERIFIED LIVE on the camera (2026-08-28): the default queue
+ * /ipc_dispatch and type 8 drive the motor in all four directions -
+ * the user fired up/down/left/right with 1 s holds and stops, all
+ * worked natively (dispatch received the envelope and ran its own
+ * motor path: UART to the CPLD board).
  *
  * usage: ptz [-q QUEUE] [-t TYPE] up|down|left|right|stop|add|del N|goto N
  *

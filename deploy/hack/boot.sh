@@ -58,4 +58,10 @@ if [ -f $HACK/auto-rtsp ]; then
   nohup $HACK/start-rtsp.sh >/tmp/rtsp-boot.log 2>&1 &
 fi
 
+# 5. Web UI (PTZ pad + CGI) on 8080 — tiny, always on. The CGI drives
+#    the motor through the app's own mqueue (see src/ptz/).
+if ! pidof httpd >/dev/null; then
+  nohup /bin/busybox1.36.1 httpd -p 8080 -h $HACK/www >/tmp/httpd.log 2>&1 &
+fi
+
 exit 0

@@ -301,6 +301,17 @@ findings — binaries pulled to `analysis/app/` (gitignored):
 4. Deploy (SD additions only), verify with the user watching, wire
    into boot.sh if wanted.
 
+**VERIFIED LIVE (2026-08-28) — no strace was needed:** the first fire
+test on `/ipc_dispatch` with the upstream envelope (type 8) drove the
+motor in ALL FOUR DIRECTIONS — the user fired up/down/left/right with
+1 s holds + stops, all worked natively through dispatch's own motor
+path. The `ptz` tool is deployed to `/tmp/sd/hack/bin/ptz`, the web UI
+is live at **http://10.1.2.19:8080/** (busybox httpd, wired into
+boot.sh idempotently, deployed md5-checked). Remaining polish: the
+snapshot CGI — rmm has a venc JPEG capture path ("Capture JPEG file
+to %s", /tmp/oss.jpg) whose trigger command id is not yet pinned; the
+UI degrades gracefully without it.
+
 ## Camera state caveats for the fresh session
 
 - The user reports the camera **reboots after a while — something is
