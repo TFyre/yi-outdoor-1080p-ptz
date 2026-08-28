@@ -462,6 +462,87 @@ static void rsp_ptz_status(int fd)
     http_reply(fd, g_resp);
 }
 
+/* the PTZ node, shared by GetNodes/GetNode: the spaces must match the
+ * profile's PTZConfiguration defaults (VelocityGenericSpace) or
+ * clients refuse the PTZ platform */
+static const char *ptz_node_xml(void)
+{
+    static char node[2048];
+
+    snprintf(node, sizeof(node),
+             "<tptz:PTZNode token=\"ptz_node\" FixedHomePosition=\"false\">"
+             "<tt:Name>ptz_node</tt:Name>"
+             "<tt:SupportedPTZSpaces>"
+             "<tt:ContinuousPanTiltVelocitySpace>"
+             "<tt:URI>http://www.onvif.org/ver10/tptz/PanTiltSpaces/"
+             "VelocityGenericSpace</tt:URI>"
+             "<tt:XRange><tt:Min>-1</tt:Min><tt:Max>1</tt:Max></tt:XRange>"
+             "<tt:YRange><tt:Min>-1</tt:Min><tt:Max>1</tt:Max></tt:YRange>"
+             "</tt:ContinuousPanTiltVelocitySpace>"
+             "</tt:SupportedPTZSpaces>"
+             "<tt:MaximumNumberOfPresets>4</tt:MaximumNumberOfPresets>"
+             "<tt:HomeSupported>false</tt:HomeSupported>"
+             "</tptz:PTZNode>");
+    return node;
+}
+
+static void rsp_ptz_nodes(int fd)
+{
+    snprintf(g_resp, sizeof(g_resp),
+             ENV_HEAD
+             "<tptz:GetNodesResponse>%s</tptz:GetNodesResponse>"
+             ENV_TAIL,
+             ptz_node_xml());
+    http_reply(fd, g_resp);
+}
+
+static void rsp_ptz_node(int fd)
+{
+    snprintf(g_resp, sizeof(g_resp),
+             ENV_HEAD
+             "<tptz:GetNodeResponse>%s</tptz:GetNodeResponse>"
+             ENV_TAIL,
+             ptz_node_xml());
+    http_reply(fd, g_resp);
+}
+
+static void rsp_ptz_configurations(int fd)
+{
+    snprintf(g_resp, sizeof(g_resp),
+             ENV_HEAD
+             "<tptz:GetConfigurationsResponse>"
+             "<tptz:PTZConfiguration token=\"ptz\">"
+             "<tt:Name>ptz</tt:Name>"
+             "<tt:UseCount>1</tt:UseCount>"
+             "<tt:NodeToken>ptz_node</tt:NodeToken>"
+             "<tt:DefaultAbsolutePantTiltPositionSpace>"
+             "http://www.onvif.org/ver10/tptz/PanTiltSpaces/PositionGenericSpace"
+             "</tt:DefaultAbsolutePantTiltPositionSpace>"
+             "<tt:DefaultRelativePanTiltTranslationSpace>"
+             "http://www.onvif.org/ver10/tptz/PanTiltSpaces/TranslationGenericSpace"
+             "</tt:DefaultRelativePanTiltTranslationSpace>"
+             "<tt:DefaultContinuousPanTiltVelocitySpace>"
+             "http://www.onvif.org/ver10/tptz/PanTiltSpaces/VelocityGenericSpace"
+             "</tt:DefaultContinuousPanTiltVelocitySpace>"
+             "</tptz:PTZConfiguration>"
+             "</tptz:GetConfigurationsResponse>"
+             ENV_TAIL);
+    http_reply(fd, g_resp);
+}
+
+static void rsp_ptz_svc_caps(int fd)
+{
+    snprintf(g_resp, sizeof(g_resp),
+             ENV_HEAD
+             "<tptz:GetServiceCapabilitiesResponse><tptz:Capabilities>"
+             "<tt:GetCompatibleConfigurations>false</tt:GetCompatibleConfigurations>"
+             "<tt:MoveStatus>false</tt:MoveStatus>"
+             "<tt:StatusPosition>false</tt:StatusPosition>"
+             "</tptz:Capabilities></tptz:GetServiceCapabilitiesResponse>"
+             ENV_TAIL);
+    http_reply(fd, g_resp);
+}
+
 /* ---- request routing ---- */
 static int handle_request(int fd)
 {
@@ -525,8 +606,20 @@ static int handle_request(int fd)
         rsp_ptz_get_presets(fd);
     else if (ACT_SUFFIX("/ptz/wsdl/", "GetStatus"))
         rsp_ptz_status(fd);
-    else
+    else if (ACT_SUFFIX("/ptz/wsdl/", "GetNodes"))
+        rsp_ptz_nodes(fd);
+    else if (ACT_SUFFIX("/ptz/wsdl/", "GetNode"))
+        rsp_ptz_node(fd);
+    else if (ACT_SUFFIX("/ptz/wsdl/", "GetConfigurations"))
+        rsp_ptz_configurations(fd);
+    else if (ACT_SUFFIX("/ptz/wsdl/", "GetServiceCapabilities"))
+        rsp_ptz_svc_caps(fd);
+    else {
+        fprintf(stderr, "onvif: FAULT for %s\n", action ? action : "(no SOAPAction)");
         http_fault(fd, "method not implemented");
+        return 0;
+    }
+    fprintf(stderr, "onvif: %s OK\n", action ? action : "(no SOAPAction)");
     return 0;
 }
 
