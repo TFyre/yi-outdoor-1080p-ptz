@@ -16,3 +16,4 @@ tools/probe-vfp2
 deploy/hack/bin/
 deploy/hack/etc/dropbear/ecdsa.key
 src/ptz/ptz
+deploy/hack/www/cgi-bin/ptz.cgi

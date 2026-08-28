@@ -153,7 +153,10 @@ build_ptz() {
     cd "$REPO/src/ptz"
     ${CROSS}-gcc $FLAGS -Wall -o ptz ptz.c -lrt
     verify_armv6 ptz
-    ls -la ptz
+    # the same binary doubles as the web CGI (argv[0] "ptz.cgi"):
+    # a shell CGI costs ~0.6 s per command on this CPU, C is ~0.05 s
+    cp ptz "$REPO/deploy/hack/www/cgi-bin/ptz.cgi"
+    ls -la ptz "$REPO/deploy/hack/www/cgi-bin/ptz.cgi"
 }
 
 case "$TARGET" in

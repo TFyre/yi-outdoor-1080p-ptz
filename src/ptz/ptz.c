@@ -29,6 +29,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <fcntl.h>
+#include <unistd.h>
 #include <mqueue.h>
 
 static const char *g_queue = "/ipc_dispatch";
@@ -125,10 +126,80 @@ static int cmd_preset(unsigned cmd, int index)
     return send_msg(p, sizeof(p), cmd, 0x0001, 0);
 }
 
+/* CGI mode: httpd execs us as /cgi-bin/ptz.cgi with QUERY_STRING.
+ * A shell CGI costs ~0.6 s per command on this CPU (fork + sh exec);
+ * as a C binary the whole request is ~0.1 s. Same semantics as the
+ * old ptz.sh: move runs until a stop arrives, capped at 10 s by a
+ * token-guarded sleeper (a stale cap never stops a newer move). */
+static int cgi_mode(void)
+{
+    static const char *dirs[] = {"up", "down", "left", "right", NULL};
+    const char *q = getenv("QUERY_STRING");
+    char buf[32] = "stop";
+    int i, dir;
+
+    if (q) {
+        const char *p = strstr(q, "dir=");
+        if (p) {
+            p += 4;
+            for (i = 0; p[i] && p[i] != '&' && i < 31; i++)
+                buf[i] = p[i];
+            buf[i] = 0;
+        }
+    }
+    for (dir = 0; dirs[dir] && strcmp(buf, dirs[dir]); dir++)
+        ;
+    if (dirs[dir] == NULL)
+        buf[0] = 0;   /* unknown = stop (safe default) */
+
+    printf("Content-type: application/json\r\n\r\n{}\n");
+    fflush(stdout);
+
+    if (buf[0] == 0 || !strcmp(buf, "stop")) {
+        cmd_stop();
+        unlink("/tmp/ptz_active");
+        return 0;
+    }
+
+    cmd_move((unsigned)dir + 1);
+    {
+        int mypid = (int)getpid();
+        FILE *f = fopen("/tmp/ptz_active", "w");
+        if (f) {
+            fprintf(f, "%d", mypid);
+            fclose(f);
+        }
+        if (fork() == 0) {
+            /* cap sleeper: detach from the HTTP connection first */
+            int nullfd = open("/dev/null", O_RDWR);
+            if (nullfd >= 0) {
+                dup2(nullfd, 0);
+                dup2(nullfd, 1);
+                dup2(nullfd, 2);
+            }
+            sleep(10);
+            f = fopen("/tmp/ptz_active", "r");
+            i = -1;
+            if (f) {
+                if (fscanf(f, "%d", &i) != 1)
+                    i = -1;
+                fclose(f);
+            }
+            if (i == mypid)
+                cmd_stop();
+            _exit(0);
+        }
+    }
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     const char *cmd;
     int arg = 0, i;
+
+    if (strstr(argv[0], "ptz.cgi") != NULL)
+        return cgi_mode();
 
     for (i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "-q") && i + 1 < argc)
