@@ -53,7 +53,7 @@
   // fetches race and a late stop can kill the next move.
   function send(dir) {
     queue = queue.then(function () {
-      return fetch('/cgi-bin/ptz.sh?dir=' + dir).then(function () {
+      return fetch('/cgi-bin/ptz.cgi?dir=' + dir).then(function () {
         statusEl.textContent = moving ? moving + ' (moving)' : dir + ' (done)';
       }).catch(function () {
         statusEl.textContent = 'command failed';
