@@ -46,13 +46,19 @@
   var pad = document.querySelector('.pad');
   var statusEl = document.getElementById('status');
   var moving = null;
+  var queue = Promise.resolve();
 
+  // Commands are serialized in a promise chain: a stop always reaches
+  // the camera before the NEXT press's move - without this, parallel
+  // fetches race and a late stop can kill the next move.
   function send(dir) {
-    fetch('/cgi-bin/ptz.sh?dir=' + dir).then(function () {
-      statusEl.textContent = moving ? moving + ' (moving)' : dir + ' (done)';
-    }).catch(function () {
-      statusEl.textContent = 'command failed';
-      moving = null;
+    queue = queue.then(function () {
+      return fetch('/cgi-bin/ptz.sh?dir=' + dir).then(function () {
+        statusEl.textContent = moving ? moving + ' (moving)' : dir + ' (done)';
+      }).catch(function () {
+        statusEl.textContent = 'command failed';
+        moving = null;
+      });
     });
   }
 

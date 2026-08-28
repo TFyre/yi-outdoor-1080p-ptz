@@ -28,9 +28,13 @@ case "$DIR" in
         # schedule a cap, and without the token every cap kills the
         # latest move).
         echo $$ > /tmp/ptz_active
+        # The redirect closes the sleeper's copy of the CGI stdout, so
+        # the HTTP response completes NOW instead of hanging 10 s
+        # (a hanging response stalls the browser's next request on
+        # keep-alive connections).
         ( sleep $MAXHOLD
           [ "$(cat /tmp/ptz_active 2>/dev/null)" = "$$" ] && /tmp/sd/hack/bin/ptz stop
-        ) &
+        ) >/dev/null 2>&1 &
         ;;
     stop)
         /tmp/sd/hack/bin/ptz stop
