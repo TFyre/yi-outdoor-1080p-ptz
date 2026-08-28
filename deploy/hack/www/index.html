@@ -13,7 +13,9 @@
   .pad { display: grid; grid-template: repeat(3, 4rem) / repeat(3, 4rem);
          gap: .5rem; justify-content: center; margin: 1.5rem 0; }
   .pad button { font-size: 1.3rem; background: #242a33; color: #dde3ea;
-                border: 1px solid #39424f; border-radius: .6rem; cursor: pointer; }
+                border: 1px solid #39424f; border-radius: .6rem; cursor: pointer;
+                touch-action: none; user-select: none;
+                -webkit-user-select: none; }
   .pad button:active { background: #39424f; }
   .pad .center { background: #181c22; color: #8a93a0; font-size: .8rem; cursor: default; }
   .snap { display: block; width: 100%; border-radius: .6rem; margin: 1rem 0; }
@@ -45,28 +47,34 @@
   var statusEl = document.getElementById('status');
   var moving = null;
 
-  function send(dir, done) {
-    fetch('/cgi-bin/ptz.sh?dir=' + dir).then(function (r) {
-      return r.text();
-    }).then(function () {
-      statusEl.textContent = dir + (done ? '' : ' (held)');
-      if (done) moving = null;
+  function send(dir) {
+    fetch('/cgi-bin/ptz.sh?dir=' + dir).then(function () {
+      statusEl.textContent = moving ? moving + ' (moving)' : dir + ' (done)';
     }).catch(function () {
       statusEl.textContent = 'command failed';
       moving = null;
     });
   }
 
+  // press-and-hold: move runs continuously until released, the button
+  // is left, the finger cancels, or the page loses focus
+  function stopMove() {
+    if (moving) send('stop');
+    moving = null;
+  }
+
   pad.addEventListener('pointerdown', function (e) {
     var b = e.target.closest('button[data-dir]');
     if (!b) return;
     moving = b.dataset.dir;
-    send(b.dataset.dir, false);
+    send(b.dataset.dir);
   });
-  pad.addEventListener('pointerup', function () {
-    if (moving) send('stop', true);
-  });
-  document.getElementById('stop').onclick = function () { send('stop', true); };
+  window.addEventListener('pointerup', stopMove);
+  window.addEventListener('pointercancel', stopMove);
+  window.addEventListener('blur', stopMove);
+  window.addEventListener('pagehide', stopMove);
+
+  document.getElementById('stop').onclick = stopMove;
   document.getElementById('snap').onclick = function () {
     document.getElementById('img').style.display = '';
     document.getElementById('img').src = '/cgi-bin/snapshot.cgi?' + Date.now();
