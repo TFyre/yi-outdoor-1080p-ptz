@@ -160,15 +160,23 @@ build_ptz() {
     ls -la ptz "$REPO/deploy/hack/www/cgi-bin/ptz.cgi"
 }
 
+build_onvif() {
+    cd "$REPO/src/onvif"
+    ${CROSS}-gcc $FLAGS -Wall -o onvif onvif.c -lrt
+    verify_armv6 onvif
+    ls -la onvif
+}
+
 case "$TARGET" in
     fshare2fifo) build_fshare2fifo ;;
     rtspserver)  build_rtspserver ;;
     ptz)         build_ptz ;;
+    onvif)       build_onvif ;;
     ringcapture) build_ringcapture ;;
     slotprobe)   build_slotprobe ;;
     endprobe)    build_endprobe ;;
     scanprobe)   build_scanprobe ;;
     captimeline) build_captimeline ;;
-    all)         build_fshare2fifo; build_ptz; build_ringcapture; build_slotprobe; build_endprobe; build_scanprobe; build_captimeline; build_rtspserver ;;
-    *) echo "usage: $0 <fshare2fifo|rtspserver|ptz|ringcapture|all>"; exit 1 ;;
+    all)         build_fshare2fifo; build_ptz; build_onvif; build_ringcapture; build_slotprobe; build_endprobe; build_scanprobe; build_captimeline; build_rtspserver ;;
+    *) echo "usage: $0 <fshare2fifo|rtspserver|ptz|onvif|ringcapture|all>"; exit 1 ;;
 esac

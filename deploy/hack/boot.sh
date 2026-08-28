@@ -64,4 +64,10 @@ if ! pidof httpd >/dev/null; then
   nohup /bin/busybox1.36.1 httpd -p 8080 -h $HACK/www >/tmp/httpd.log 2>&1 &
 fi
 
+# 6. ONVIF Profile S server on 8082 (SOAP over HTTP + PTZ; no
+#    WS-Discovery yet - add manually in clients). See src/onvif/.
+if ! pidof onvif >/dev/null; then
+  nohup $BIN/onvif -p 8082 >/tmp/onvif.log 2>&1 &
+fi
+
 exit 0
