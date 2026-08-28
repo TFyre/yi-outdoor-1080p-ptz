@@ -389,16 +389,33 @@ static void rsp_stream_uri(int fd)
     http_reply(fd, g_resp);
 }
 
+/* dump the raw request body (debugging: distinguish "HA sent zero
+ * velocity" from "we parsed zero"). The body is NUL-terminated in
+ * req[]; multi-line XML goes to the log as-is. */
+static void log_raw_body(const char *what, const char *body)
+{
+    fprintf(stderr, "onvif: RAW %s BEGIN\n%s\nonvif: RAW %s END\n",
+            what, body, what);
+}
+
 static void rsp_ptz_move(int fd, const char *body)
 {
     const char *pt = strstr(body, "PanTilt");
     float x = 0, y = 0;
 
+    log_raw_body("ContinuousMove", body);
+
     if (pt) {
         const char *xv = xml_attr(pt, "x");
-        const char *yv = xml_attr(pt, "y");
+        const char *yv;
+
+        /* xml_attr returns a pointer into ITS OWN static buffer - the
+         * next call overwrites it. x MUST be converted before y is
+         * extracted, or both end up reading y's value (the left/right
+         * arrows parsed as 0.00/0.00 -> STOP because of exactly this). */
         if (xv)
             x = strtof(xv, NULL);
+        yv = xml_attr(pt, "y");
         if (yv)
             y = strtof(yv, NULL);
     }
@@ -421,8 +438,9 @@ static void rsp_ptz_move(int fd, const char *body)
     http_reply(fd, g_resp);
 }
 
-static void rsp_ptz_stop(int fd)
+static void rsp_ptz_stop(int fd, const char *body)
 {
+    log_raw_body("Stop", body);
     ptz_stop();
     g_move_at = 0;
     snprintf(g_resp, sizeof(g_resp),
@@ -654,12 +672,69 @@ static void rsp_network_interfaces(int fd)
 }
 
 /* ---- request routing ---- */
+static const char *find_hdr_end(const char *buf, size_t n)
+{
+    size_t i;
+
+    for (i = 0; i + 3 < n; i++)
+        if (buf[i] == '\r' && buf[i + 1] == '\n' &&
+            buf[i + 2] == '\r' && buf[i + 3] == '\n')
+            return buf + i;
+    return NULL;
+}
+
+/* Read one full HTTP request: loop until the header terminator, then
+ * until Content-Length body bytes have arrived. A single read() was
+ * NOT enough - zeep's requests arrive in multiple TCP segments and
+ * the SOAP body was being cut mid-attribute (PanTilt x="...) which
+ * parsed as zero velocity. Returns bytes buffered, 0 on EOF. */
+static ssize_t read_request(int fd, char *req, size_t cap)
+{
+    size_t n = 0, hdr_end = 0, body_len = 0;
+    int have_cl = 0;
+
+    while (n < cap - 1) {
+        ssize_t r;
+
+        if (hdr_end && have_cl && n >= hdr_end + body_len)
+            break;
+        r = read(fd, req + n, cap - 1 - n);
+        if (r <= 0) {
+            if (r < 0 && errno == EINTR)
+                continue;
+            break;   /* EOF or SO_RCVTIMEO: process what we have */
+        }
+        n += (size_t)r;
+        req[n] = 0;
+        if (!hdr_end) {
+            const char *e = find_hdr_end(req, n);
+            if (e)
+                hdr_end = (size_t)(e - req) + 4;
+        }
+        if (hdr_end && !have_cl) {
+            char save = req[hdr_end];
+            const char *cl;
+
+            req[hdr_end] = 0;
+            cl = strstr(req, "Content-Length:");
+            if (cl)
+                body_len = (size_t)strtoul(cl + 15, NULL, 10);
+            req[hdr_end] = save;
+            have_cl = 1;
+            if (body_len > cap - 1 - hdr_end)   /* client lied: cap it */
+                body_len = cap - 1 - hdr_end;
+        }
+    }
+    return (ssize_t)n;
+}
+
 static int handle_request(int fd)
 {
     char req[16384];
-    ssize_t n = read(fd, req, sizeof(req) - 1);
+    ssize_t n;
     const char *action, *body;
 
+    n = read_request(fd, req, sizeof(req));
     if (n <= 0)
         return -1;
     req[n] = 0;
@@ -707,7 +782,7 @@ static int handle_request(int fd)
     else if (ACT_SUFFIX("/ptz/wsdl/", "ContinuousMove"))
         rsp_ptz_move(fd, body);
     else if (ACT_SUFFIX("/ptz/wsdl/", "Stop"))
-        rsp_ptz_stop(fd);
+        rsp_ptz_stop(fd, body);
     else if (ACT_SUFFIX("/ptz/wsdl/", "SetPreset"))
         rsp_ptz_set_preset(fd, body);
     else if (ACT_SUFFIX("/ptz/wsdl/", "GotoPreset"))
@@ -794,6 +869,11 @@ int main(int argc, char **argv)
         csock = accept(lsock, (struct sockaddr *)&addr, &alen);
         if (csock < 0)
             continue;
+        {
+            struct timeval rto = {5, 0};   /* read timeout: no client
+                                            * may stall the whole loop */
+            setsockopt(csock, SOL_SOCKET, SO_RCVTIMEO, &rto, sizeof(rto));
+        }
         handle_request(csock);
         close(csock);
     }
