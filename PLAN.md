@@ -1,4 +1,4 @@
-# PLAN — current state and next steps (updated 2026-08-27)
+# PLAN — current state and next steps (updated 2026-08-29)
 
 This is the live plan. The user drives each step; nothing here is auto-approved.
 
@@ -311,6 +311,53 @@ boot.sh idempotently, deployed md5-checked). Remaining polish: the
 snapshot CGI — rmm has a venc JPEG capture path ("Capture JPEG file
 to %s", /tmp/oss.jpg) whose trigger command id is not yet pinned; the
 UI degrades gracefully without it.
+
+## Workstream: ONVIF Profile S (DONE 2026-08-29 — video + 4-dir PTZ verified in HA)
+
+Hand-rolled SOAP/XML-over-HTTP daemon (`src/onvif/onvif.c`, ~3 KB,
+ARMv6-clean, port 8082, wired into boot.sh): device service
+(GetDeviceInformation/Capabilities/Scopes/SystemDateAndTime/GetServices/
+GetNetworkInterfaces — real wlan0 MAC), media (GetProfiles/GetStreamUri),
+PTZ (ContinuousMove/Stop/SetPreset/GotoPreset/GetPresets/GetStatus/
+GetNodes/GetNode/GetConfigurations/GetServiceCapabilities).
+`rtsp://10.1.2.19/ch0_0.h264` serves in Home Assistant (zeep client).
+
+**The HA bring-up found three real server bugs (all fixed + committed):**
+
+- `e436d9d` — GetProfiles element order: VideoEncoderConfiguration must
+  follow AudioSourceConfiguration (zeep validates schema order; HA
+  reported "ContinuousMove not supported").
+- `6ff6e3b` — velocity tie-break prefers tilt on equal magnitudes (this
+  camera's vertical axis is inverted: 1=down 2=up).
+- `4e8e50f` — the left/right-arrows-do-nothing debugging round:
+  1. **loop-read** — zeep's requests arrive in multiple TCP segments;
+     a single read() cut the SOAP body mid-attribute (`PanTilt x="...`)
+     which parsed as zero velocity. `read_request()` now loops until
+     Content-Length is satisfied; SO_RCVTIMEO 5 s per client socket.
+  2. **xml_attr static-buffer clobber** — `xml_attr` returns a pointer
+     into its own `static char val[64]`; `x` was strtof'd after `y`'s
+     extraction overwrote it, so BOTH axes read y's value — up/down
+     looked diagonal, left/right looked zero. x is now converted before
+     y is extracted.
+  3. Raw PTZ request bodies are logged (RAW BEGIN/END markers in
+     /tmp/onvif.log) — kept for future debugging.
+
+**Diagonals: NOT supported by the app.** Confirmed in dispatch/rmm
+disassembly: the MOVE envelope carries ONE scalar dir (1-4); dispatch
+swaps pairs for the mount-flip settings and forwards the raw value,
+rmm forwards it unchanged (the envelope's last u32 is always 0 — a
+dead field). No 5-8 diagonal values exist anywhere in the path. The
+stock app's own pad is 4-way too. A diagonal request is realized as
+the dominant axis (ONVIF-legal: the device decides).
+
+**Known gaps (backlog, user picks):**
+1. WS-Discovery UDP responder — HA/ODM auto-discovery instead of
+   manual add.
+2. GetStatus real position values — dispatch has `get_ptz_position` +
+   "save device ptz position(%d,%d)"; the read-back command is not yet
+   RE'd (currently a static 0/0 response).
+3. Snapshot: rmm venc JPEG trigger command id (see PTZ section) — would
+   also enable GetSnapshotUri.
 
 ## Camera state caveats for the fresh session
 
