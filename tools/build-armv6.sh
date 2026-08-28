@@ -155,6 +155,7 @@ build_ptz() {
     verify_armv6 ptz
     # the same binary doubles as the web CGI (argv[0] "ptz.cgi"):
     # a shell CGI costs ~0.6 s per command on this CPU, C is ~0.05 s
+    mkdir -p "$REPO/deploy/hack/www/cgi-bin"
     cp ptz "$REPO/deploy/hack/www/cgi-bin/ptz.cgi"
     ls -la ptz "$REPO/deploy/hack/www/cgi-bin/ptz.cgi"
 }
