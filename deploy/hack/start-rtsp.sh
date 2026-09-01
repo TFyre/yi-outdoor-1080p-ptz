@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later
 # /tmp/sd/hack/start-rtsp.sh — bring up the live H.264 + AAC RTSP chain.
 #
 # Runs detached from boot.sh: the stock app (rmm) creates

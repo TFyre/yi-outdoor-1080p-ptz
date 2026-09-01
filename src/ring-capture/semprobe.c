@@ -1,4 +1,5 @@
 /* semprobe.c - observe the app's reader-slot semaphores without
+ * SPDX-License-Identifier: GPL-3.0-or-later
  * disturbing them: timed-wait on each notify semaphore and report
  * which slots fire and when. The firing pattern reveals the writer's
  * fan-out (which consumer slots the app's own readers hold).

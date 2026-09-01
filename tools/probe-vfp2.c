@@ -1,4 +1,5 @@
 /* ARM1176 VFP "first instruction" probe — run ON the camera.
+ * SPDX-License-Identifier: GPL-3.0-or-later
  *
  * probe-vfp (single process) showed every instruction legal once the VFP
  * unit was warmed up with a single-precision op. This one makes a given

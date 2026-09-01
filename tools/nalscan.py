@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Scan an Annex-B H.264 file: NAL type histogram + count of NALs under a
 minimum body size. Usage: python3 nalscan.py <file> [min_size]"""
 import sys

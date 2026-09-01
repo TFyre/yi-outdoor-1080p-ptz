@@ -1,4 +1,5 @@
 /* typescan.c - walk the record ring with the CORRECT framing (26-byte
+ * SPDX-License-Identifier: GPL-3.0-or-later
  * header: len@+0, seq@+4, magic@+8, ts@+16, type@+20) from the
  * published tail for the published valid bytes, and report the type
  * histogram + the NAL types inside the hi-res (0x0400) payloads.

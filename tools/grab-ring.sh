@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: GPL-3.0-or-later
 # Pull a raw ring snapshot from the camera to the local machine.
 # Usage: tools/grab-ring.sh [output.bin]   (default: analysis/ring.bin)
 OUT="${1:-analysis/ring.bin}"

@@ -1,4 +1,5 @@
 /* ring-capture.c - the REFERENCE reader: record the app's raw output
+ * SPDX-License-Identifier: GPL-3.0-or-later
  * from the ring for N seconds, in the true write order (wraps included).
  *
  * Unlike fshare2fifo this does no gating, joining, or stream filtering -

@@ -1,4 +1,5 @@
 /* scanprobe.c - locate the TRUE write head when the c0 checkpoints are
+ * SPDX-License-Identifier: GPL-3.0-or-later
  * dead (the current raw-mode era): snapshot the ring, wait 300 ms, and
  * diff the live ring against the snapshot - the writer writes
  * contiguously, so the top of the newest changed run IS the write head

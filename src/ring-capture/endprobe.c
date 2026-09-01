@@ -1,4 +1,5 @@
 /* endprobe.c - what sits AT the committed ends? Each time the writer
+ * SPDX-License-Identifier: GPL-3.0-or-later
  * publishes a new committed end (hdr 0x0C or 0x10 advances), dump the
  * bytes at that position. If the ends are frame-aligned they land on a
  * record header (magic 0x6a8c, type 0x0400 hi-res / 0x0800 low-res /

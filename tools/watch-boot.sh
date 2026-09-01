@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: GPL-3.0-or-later
 # Two-phase boot watcher: waits for the current dropbear to go down (reboot),
 # then for it to come back, then proves SSH auth still works post-boot.
 # Usage: tools/watch-boot.sh   (runs until the camera comes back)

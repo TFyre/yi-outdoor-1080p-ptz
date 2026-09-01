@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later
 # Swap in the new rRTSPServer, restart the chain with the tee armed.
 # Run on the camera: ssh ... "sh -s" < tools/swap-rtsp.sh
 # NOTE: no `set -e` - the producer-wait loop relies on if/break.

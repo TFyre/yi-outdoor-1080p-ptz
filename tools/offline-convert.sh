@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: GPL-3.0-or-later
 # Offline ring conversion (run INSIDE WSL): replay a ring snapshot as a
 # live feed, walk it with the x86 build of fshare2fifo, capture the fifo
 # with ffmpeg into a playable h264 file.

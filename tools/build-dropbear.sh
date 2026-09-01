@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: GPL-3.0-or-later
 # Static ARMv6 build of dropbear (dropbearmulti: dropbear/dropbearkey/scp/
 # dbclient) for the camera. Replaces the 2018.76 binary inherited from the
 # yi-hack release — that one predates CVE-2019-6111, CVE-2025-14282 and

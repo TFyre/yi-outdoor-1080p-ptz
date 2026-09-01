@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: GPL-3.0-or-later
 # Static ARMv6 build of busybox (full defconfig applet set) for the camera.
 # Same toolchain + flags as build-armv6.sh. The device's stock busybox is
 # 1.26.2 and lacks many applets (id/wc/head/uname/base64/mkfifo...).

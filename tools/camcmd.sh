@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: GPL-3.0-or-later
 # One-shot command runner over the camera's telnet shell (busybox ash).
 # Usage: camcmd.sh "df -h; cat /proc/mtd"
 # Output is returned on stdout; the connection is closed when the command finishes.

@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: GPL-3.0-or-later
 # Native (x86_64) build of rRTSPServer for debugging under gdb in WSL.
 set -e
 

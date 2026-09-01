@@ -1,4 +1,5 @@
 /* ARM1176 (VFPv2) instruction-set probe — run ON the camera.
+ * SPDX-License-Identifier: GPL-3.0-or-later
  *
  * The musl arm port's setjmp/longjmp saves/restores VFP double registers
  * with FLDMD/FSTMD ({d8-d15} multiples) when HWCAP_VFP is set, and the

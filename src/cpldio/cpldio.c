@@ -1,4 +1,5 @@
 /*
+ * SPDX-License-Identifier: GPL-3.0-or-later
  * cpldio - fire one /dev/cpld_periph ioctl from the shell.
  *
  * Debugging the white-LED (flashlight) control path: dispatch runs

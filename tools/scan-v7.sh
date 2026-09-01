@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: GPL-3.0-or-later
 # Scan ARM binaries/objects for instructions that SIGILL on ARM1176:
 # ARMv7 integer ops + VFPv3/NEON-only ops.
 #

@@ -1,4 +1,5 @@
 /* peek0401.c - where does the era's IDR live? Print the chain
+ * SPDX-License-Identifier: GPL-3.0-or-later
  * records' payloads in full (0x0422/0x0404/0x0401) and count EVERY
  * NAL inside every 0x0400 payload (multi-NAL payloads would hide an
  * IDR behind the first P slice). */

@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: GPL-3.0-or-later
 # A/V sync repro (run INSIDE WSL): feed both fifos at their real-time
 # rates, capture ch0_0 (video+audio), and compare the two streams'
 # pts spans. Both streams share the muxer's 90 kHz clock, so the span

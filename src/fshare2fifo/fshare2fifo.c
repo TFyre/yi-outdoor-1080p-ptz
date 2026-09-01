@@ -1,6 +1,7 @@
 /*
+ * SPDX-License-Identifier: GPL-3.0-or-later
  * fshare2fifo v2 - a PROPER reader of the fshare shared-frame protocol
- * (reverse-engineered from tserver/rmm, analysis/fshare-protocol.md).
+ * (reverse-engineered from tserver/rmm, docs/fshare-protocol.md).
  *
  * The ring is NOT a byte stream that needs re-synchronising: it is a
  * sequence-numbered record log with a published tail (0x10), a

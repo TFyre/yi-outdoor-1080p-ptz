@@ -1,4 +1,5 @@
 /* cap-timeline.c - capture the RESERVATION TIMELINE plus a
+ * SPDX-License-Identifier: GPL-3.0-or-later
  * tear-checked ring snapshot, for offline validation of the
  * region-emission reader (fshare2fifo v2).
  *

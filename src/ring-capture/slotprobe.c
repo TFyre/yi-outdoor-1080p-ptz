@@ -1,4 +1,5 @@
 /* slotprobe.c - empirically map the fshare slot protocol, strictly
+ * SPDX-License-Identifier: GPL-3.0-or-later
  * read-only. Answers, without touching any lock or the app's data:
  *
  *  A: what else lives in /dev/shm besides the semaphores

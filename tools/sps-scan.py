@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Scan a fshare buffer sample for SPS NALs and parse their dimensions.
 Reveals whether the ring interleaves multiple streams (resolutions).
 Usage: python3 sps_scan.py <file> [<file>...]

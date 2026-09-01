@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: GPL-3.0-or-later
 # Static ARMv6 build of curl for the camera — HTTP (+RTSP) only, no TLS.
 # TLS would need mbedtls/openssl static builds; ONVIF SOAP is plain HTTP,
 # so this is enough for Phase 3. Same toolchain + flags as build-armv6.sh.

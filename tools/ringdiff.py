@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Diff two fshare ring snapshots: the changed byte ranges are exactly
 what the app wrote between the two captures. Prints each changed region
 (offset, size, leading bytes) and scans for start codes inside it.

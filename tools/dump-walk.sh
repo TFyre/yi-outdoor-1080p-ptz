@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later
 # Run the producer in file mode for ~35 s, snapshot the ring at the end,
 # restore the RTSP chain. The dump and the snapshot are era-coherent:
 # the dump's tail is the snapshot's newest content.

@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: GPL-3.0-or-later
 # ARMv6-clean STATIC builds of the camera binaries (run on ARM1176 + VFPv2).
 #
 # Toolchain: musl.cc arm-linux-musleabi (SOFT-float, ARMv5TE baseline) at

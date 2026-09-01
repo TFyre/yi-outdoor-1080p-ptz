@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: GPL-3.0-or-later
 # Prepare an SD card for the camera: copy debug.sh + the hack package onto
 # a FAT32 card. For a fresh camera this IS the entire install — the stock
 # firmware runs debug.sh at boot, which brings up telnet 9999, SSH 2222 and

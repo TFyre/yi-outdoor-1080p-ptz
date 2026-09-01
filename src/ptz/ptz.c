@@ -1,4 +1,5 @@
 /*
+ * SPDX-License-Identifier: GPL-3.0-or-later
  * ptz - drive the camera's PTZ through the app's OWN IPC (its POSIX
  * mqueue family), so the stock app keeps handling motor calibration,
  * limits, and position persistence.

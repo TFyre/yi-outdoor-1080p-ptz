@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later
 # debug.sh — the stock firmware runs this from the SD card root at boot.
 # It is just the entry point: everything lives in the hack package
 # (see /tmp/sd/hack/boot.sh).
