@@ -167,16 +167,24 @@ build_onvif() {
     ls -la onvif
 }
 
+build_cpldio() {
+    cd "$REPO/src/cpldio"
+    ${CROSS}-gcc $FLAGS -Wall -o cpldio cpldio.c
+    verify_armv6 cpldio
+    ls -la cpldio
+}
+
 case "$TARGET" in
     fshare2fifo) build_fshare2fifo ;;
     rtspserver)  build_rtspserver ;;
     ptz)         build_ptz ;;
     onvif)       build_onvif ;;
+    cpldio)      build_cpldio ;;
     ringcapture) build_ringcapture ;;
     slotprobe)   build_slotprobe ;;
     endprobe)    build_endprobe ;;
     scanprobe)   build_scanprobe ;;
     captimeline) build_captimeline ;;
-    all)         build_fshare2fifo; build_ptz; build_onvif; build_ringcapture; build_slotprobe; build_endprobe; build_scanprobe; build_captimeline; build_rtspserver ;;
-    *) echo "usage: $0 <fshare2fifo|rtspserver|ptz|onvif|ringcapture|all>"; exit 1 ;;
+    all)         build_fshare2fifo; build_ptz; build_onvif; build_cpldio; build_ringcapture; build_slotprobe; build_endprobe; build_scanprobe; build_captimeline; build_rtspserver ;;
+    *) echo "usage: $0 <fshare2fifo|rtspserver|ptz|onvif|cpldio|ringcapture|all>"; exit 1 ;;
 esac
