@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later
 # /tmp/sd/hack/boot.sh — camera boot orchestrator.
 #
 # The stock firmware runs /tmp/sd/debug.sh at boot; that one-liner execs
@@ -31,9 +32,13 @@ if [ ! -f $HACK/etc/dropbear/ecdsa.key ]; then
   cat /tmp/dropbear/ecdsa.key > $HACK/etc/dropbear/ecdsa.key
 fi
 mkdir -p /root/.ssh
-cat $HACK/root/.ssh/authorized_keys > /root/.ssh/authorized_keys
-chmod 700 /root/.ssh
-chmod 600 /root/.ssh/authorized_keys
+# Only if the user provided their key (the repo ships a .example, the real
+# file is gitignored — a fresh clone has none, and ssh auth stays off).
+if [ -f $HACK/root/.ssh/authorized_keys ]; then
+  cat $HACK/root/.ssh/authorized_keys > /root/.ssh/authorized_keys
+  chmod 700 /root/.ssh
+  chmod 600 /root/.ssh/authorized_keys
+fi
 # dropbearmulti applets in PATH: client-side scp -O execs a remote `scp -t`
 ln -sf $BIN/dropbearmulti /bin/scp
 ln -sf $BIN/dropbearmulti /bin/dbclient
