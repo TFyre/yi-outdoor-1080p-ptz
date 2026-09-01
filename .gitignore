@@ -18,3 +18,4 @@ deploy/hack/etc/dropbear/ecdsa.key
 src/ptz/ptz
 deploy/hack/www/cgi-bin/ptz.cgi
 src/onvif/onvif
+src/cpldio/cpldio
