@@ -359,6 +359,43 @@ the dominant axis (ONVIF-legal: the device decides).
 3. Snapshot: rmm venc JPEG trigger command id (see PTZ section) — would
    also enable GetSnapshotUri.
 
+## Workstream: flashlight / white LED (DONE 2026-09-01 — auto/on/off via the app's own command)
+
+**Ground truth captured from the app itself** (the experiment): the
+phone app's lamp setting arrives as p2p `IOTYPE_USER_IPCAM_SET_WHITE_LED_MODE`
+→ dispatch logs `set DISPATCH_SET_WHITE_LED_MODE, N` and runs
+`save_config → write_mtd_conf` (persisted to flash). The app's values:
+**1 = on, 0 = off, 2 = auto**. The envelope is `{1, 8, 0x009c, 0x0001,
+4, N}` (cmd 0x9c = DISPATCH_SET_WHITE_LED_MODE): it stores the mode in
+the day/night judge's config field (cfg+0x19c0) AND persists it; mode 1
+also fires `ioctl(/dev/cpld_periph, 0x7021)` immediately.
+
+**The dead end that preceded it**: the FACTORY variant (cmd 0xa2,
+`FACTORY_SET_WHITE_LED_MODE`) fires the same ioctls (0x7021/0x7022)
+but stores NOTHING — rmm's judge (`is_day_night_judge`, logs
+"white_led_light is light set day_mode" every second while managing)
+re-applies its stored state over the forced ioctl, which was the whole
+"intermittent / works for a while then flips back" behavior. The
+momentary toggles cmd 0x76/0x77 (ioctl 0x701c/0x701b) are the app's
+live-view flashlight button — kept in the tool as `lighton`/`lightoff`.
+
+**ioctl map on /dev/cpld_periph** (fd slot +40 of dispatch's global
+struct, verified via /proc/PID/mem): 0x701c = on, 0x701b = off,
+0x7021 = on, 0x7022 = off, 0x7028 = off (the power-off sequence fires
+0x701b+0x7022+0x7028). **0x7019 HANGS the kernel path and the camera
+watchdog-reboots — never fire it** (the 0x7018/0x7019 pair is some
+wait/off sequence the app only runs in its own state).
+
+**Observability win**: the app writes rotating logs (~100 KB each) to
+`/tmp/sd/log/log1..5.txt` — every p2p command, dispatch handler, and
+the judge's decisions with timestamps. This is how the app's exact
+envelopes were captured; grep for "WHITE_LED" / "white_led".
+
+**Delivery**: `ptz light on|off|auto` (and numeric `lightmode N`,
+toggles `lighton`/`lightoff`), CGI `light=on|off|auto` on the web pad
+(three buttons). Because the command is the app's own, the state is
+stable AND the YI app shows the change after its next config sync.
+
 ## Camera state caveats for the fresh session
 
 - The user reports the camera **reboots after a while — something is
