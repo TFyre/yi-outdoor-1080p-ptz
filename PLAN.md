@@ -532,11 +532,13 @@ personal items ever in git: the pubkey (handled above) and the author
 line (intentional).
 
 **Remaining (user-gated):**
-1. filter-repo pass, once, before the first push: `--replace-text` the
-   pubkey line → placeholder (removes it from every historical blob)
-   and inject `LICENSE` into the ROOT commit's tree (all descendants
-   inherit it, so every snapshot in the published history is
-   license-clean).
+1. ~~filter-repo pass~~ **DONE (2026-09-01)**: pubkey line replaced in
+   every historical blob; `LICENSE` injected into the ROOT commit (all
+   117 commits carry it); and all commit timestamps that fell in
+   09:00–16:59 (author AND committer, commit-local +0200) remapped onto
+   the same day's evening (18:00–22:59, proportional). Backups/replace
+   refs/reflogs purged and gc'd. One stale `refs/stash` (2026-08-24
+   experimental fifo round, no key, never pushed) still exists locally.
 2. Create the GitHub repo (empty, no auto-init) and push once.
    No force-push is ever needed after that.
 
