@@ -1,0 +1,62 @@
+name: build-armv6
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # verify_armv6 in tools/build-armv6.sh needs arm-linux-gnueabihf-objdump
+      - name: Install objdump for the ARMv6 purity scan
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq binutils-arm-linux-gnueabihf
+
+      # The musl.cc soft-float cross toolchain (~100 MB). Static key on
+      # purpose: bump to -v2 to force a fresh toolchain fetch.
+      - name: Cache the musl.cc ARMv6 toolchain
+        id: tc-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/musl-tc
+          key: muslcc-arm-linux-musleabi-cross-v1
+
+      - name: Fetch the musl.cc ARMv6 toolchain
+        if: steps.tc-cache.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p ~/musl-tc
+          curl -fsSL -o /tmp/tc.tgz https://musl.cc/arm-linux-musleabi-cross.tgz
+          tar -xzf /tmp/tc.tgz -C ~/musl-tc
+
+      # The repo's own C tools. NOT rtspserver (needs the live555 tree
+      # from a local yi-hack-v5 checkout) and not busybox/curl/dropbear
+      # (separate source tarballs, long builds).
+      - name: Build the camera tools (ARMv6-clean)
+        run: |
+          for t in fshare2fifo ptz onvif cpldio \
+                   ringcapture slotprobe endprobe scanprobe captimeline; do
+            bash tools/build-armv6.sh "$t"
+          done
+
+      - name: Stage the built binaries
+        run: |
+          mkdir -p dist
+          cp src/fshare2fifo/fshare2fifo src/fshare2fifo/f2f_audio dist/
+          cp src/ptz/ptz src/onvif/onvif src/cpldio/cpldio dist/
+          cp src/ring-capture/ring-capture src/ring-capture/slotprobe \
+             src/ring-capture/endprobe src/ring-capture/scanprobe \
+             src/ring-capture/cap-timeline dist/
+          cp deploy/hack/www/cgi-bin/ptz.cgi dist/
+          ls -la dist/
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: camera-tools-armv6
+          path: dist/
+          retention-days: 30
