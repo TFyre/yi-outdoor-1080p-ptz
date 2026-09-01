@@ -39,6 +39,12 @@
   <button id="snap">snapshot</button>
   <button id="refresh">refresh</button>
 </div>
+<div class="row" style="margin-top:.5rem">
+  <span class="center" style="padding:.6rem 1rem">light</span>
+  <button data-light="auto">auto</button>
+  <button data-light="on">on</button>
+  <button data-light="off">off</button>
+</div>
 <p id="status"></p>
 <img id="img" class="snap" alt="snapshot" src="/cgi-bin/snapshot.cgi" onerror="this.style.display='none'">
 <p>Live view (desktop player): <a href="rtsp://IP_OF_CAMERA/ch0_0.h264">rtsp://IP_OF_CAMERA/ch0_0.h264</a></p>
@@ -81,6 +87,19 @@
   window.addEventListener('pagehide', stopMove);
 
   document.getElementById('stop').onclick = stopMove;
+  // flashlight mode buttons - same serialized queue as the pad so a
+  // light command never races a move
+  Array.prototype.forEach.call(document.querySelectorAll('button[data-light]'), function (b) {
+    b.onclick = function () {
+      queue = queue.then(function () {
+        return fetch('/cgi-bin/ptz.cgi?light=' + b.dataset.light).then(function () {
+          statusEl.textContent = 'light: ' + b.dataset.light;
+        }).catch(function () {
+          statusEl.textContent = 'light command failed';
+        });
+      });
+    };
+  });
   document.getElementById('snap').onclick = function () {
     document.getElementById('img').style.display = '';
     document.getElementById('img').src = '/cgi-bin/snapshot.cgi?' + Date.now();

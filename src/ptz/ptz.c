@@ -124,6 +124,34 @@ static int cmd_stop(void)
     return send_msg(z, sizeof(z), 0x4007, 0x0001, 0);
 }
 
+/* white LED (flashlight) commands - dispatch disassembly + the app's
+ * own p2p traffic captured live (2026-08-29/09-01, /tmp/sd/log/*.txt):
+ *   LIGHT_ON  = {1, type, 0x0076, 0x0001, 0}        ioctl 0x701c
+ *   LIGHT_OFF = {1, type, 0x0077, 0x0001, 0}        ioctl 0x701b
+ *   (the momentary toggles the app's live-view flashlight button uses)
+ *   LIGHT_MODE = {1, type, 0x009c, 0x0001, 4, N}    DISPATCH_SET_WHITE_LED_MODE
+ *       N: 1 = ON (also fires ioctl 0x7021 immediately), 0 = OFF, 2 = AUTO
+ *   This is THE setting command (IOTYPE_USER_IPCAM_SET_WHITE_LED_MODE):
+ *   it stores the mode in the day/night judge's config field and
+ *   persists to flash (save_config -> write_mtd_conf). The factory
+ *   variant (0xa2, ioctl-only) does NOT store, so the judge re-applies
+ *   its old state over it - the observed "intermittent" behavior. */
+static int cmd_light_toggle(int on)
+{
+    unsigned char z[4] = {0, 0, 0, 0};
+
+    return send_msg(z, sizeof(z), on ? 0x0076 : 0x0077, 0x0001, 0);
+}
+
+static int cmd_light_mode(int mode)
+{
+    unsigned char p[8];
+
+    put32(p, 4);
+    put32(p + 4, (unsigned)mode);
+    return send_msg(p, sizeof(p), 0x009c, 0x0001, 0);
+}
+
 static int cmd_preset(unsigned cmd, int index)
 {
     /* add:  {1, type, 0x4000, 0x0001, 0}              (16 B)
@@ -164,6 +192,28 @@ static int cgi_mode(void)
         ;
     if (dirs[dir] == NULL)
         buf[0] = 0;   /* unknown = stop (safe default) */
+
+    /* flashlight: light=on|off|auto -> DISPATCH_SET_WHITE_LED_MODE
+     * 1/0/2 (the app's own command, captured live 2026-09-01: the
+     * setting is stored in the day/night judge's config + flash) */
+    if (q) {
+        const char *p = strstr(q, "light=");
+        if (p) {
+            char lbuf[8] = "";
+            p += 6;
+            for (i = 0; p[i] && p[i] != '&' && i < 7; i++)
+                lbuf[i] = p[i];
+            printf("Content-type: application/json\r\n\r\n{}\n");
+            fflush(stdout);
+            if (!strcmp(lbuf, "on"))
+                cmd_light_mode(1);
+            else if (!strcmp(lbuf, "off"))
+                cmd_light_mode(0);
+            else
+                cmd_light_mode(2);   /* auto (safe default) */
+            return 0;
+        }
+    }
 
     printf("Content-type: application/json\r\n\r\n{}\n");
     fflush(stdout);
@@ -226,15 +276,28 @@ int main(int argc, char **argv)
     }
     if (i >= argc) {
         fprintf(stderr, "usage: ptz [-x] [-q QUEUE] [-t TYPE] "
-                        "up|down|left|right|stop|add|del N|goto N\n");
+                        "up|down|left|right|stop|add|del N|goto N|"
+                        "light on|off|auto|lighton|lightoff|lightmode N\n");
         return 2;
     }
     cmd = argv[i];
     if (i + 1 < argc)
         arg = atoi(argv[i + 1]);
 
+    if (!strcmp(cmd, "light") && i + 1 < argc) {
+        const char *m = argv[i + 1];
+
+        if (!strcmp(m, "on"))    return cmd_light_mode(1);
+        if (!strcmp(m, "off"))   return cmd_light_mode(0);
+        if (!strcmp(m, "auto"))  return cmd_light_mode(2);
+        fprintf(stderr, "ptz: light: use on|off|auto\n");
+        return 2;
+    }
     if (dir_value(cmd))           return cmd_move((unsigned)dir_value(cmd));
     if (!strcmp(cmd, "stop"))     return cmd_stop();
+    if (!strcmp(cmd, "lighton"))  return cmd_light_toggle(1);
+    if (!strcmp(cmd, "lightoff")) return cmd_light_toggle(0);
+    if (!strcmp(cmd, "lightmode")) return cmd_light_mode(arg);
     if (!strcmp(cmd, "add"))      return cmd_preset(0x4000, 0);
     if (!strcmp(cmd, "del"))      return cmd_preset(0x4001, arg);
     if (!strcmp(cmd, "goto"))     return cmd_preset(0x4002, arg);
