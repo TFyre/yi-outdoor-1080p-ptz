@@ -391,9 +391,12 @@ static void rsp_stream_uri(int fd)
 
 /* dump the raw request body (debugging: distinguish "HA sent zero
  * velocity" from "we parsed zero"). The body is NUL-terminated in
- * req[]; multi-line XML goes to the log as-is. */
+ * req[]; multi-line XML goes to the log as-is. OFF unless the daemon
+ * is started with ONVIF_RAWLOG=1 in the environment. */
 static void log_raw_body(const char *what, const char *body)
 {
+    if (!getenv("ONVIF_RAWLOG"))
+        return;
     fprintf(stderr, "onvif: RAW %s BEGIN\n%s\nonvif: RAW %s END\n",
             what, body, what);
 }
