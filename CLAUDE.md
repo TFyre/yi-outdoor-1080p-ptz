@@ -339,3 +339,56 @@ Keep stock-firmware dumps out of git.
 
 - The camera is **unsupported** by upstream [alienatedsec/yi-hack-v5](https://github.com/alienatedsec/yi-hack-v5) (a Hi3518ev200 project, GPL-3.0; its "Yi Outdoor" support is the older h30 model, base fw 3.0.0.0D). Porting the hack to this Fullhan unit is the core challenge.
 - [Issue #457](https://github.com/alienatedsec/yi-hack-v5/issues/457) (closed, not planned) documents prior recon of this exact unit. Baseline tried: release 0.4.1 (`yi_outdoor_0.4.1.tgz`), payload at `/tmp/sd/yi-hack-v5/` (binaries in `bin/`, busybox in `busybox/`). The SD also holds later experiments (mediamtx armv6, ffmpeg, h201c/r10m/cloud-dome tarballs).
+
+## Working with the camera — operational notes (2026-09-01)
+
+**WSL (the build + RE environment):** the distro is **Ubuntu** (a
+`-d Debian` call fails with DISTRO_NOT_FOUND). Builds:
+`wsl.exe -d Ubuntu -- bash -lc "cd /mnt/c/myprogs/yi-outdoor-1080p-ptz && tools/build-armv6.sh <target>"`.
+ARM disassembly of pulled app binaries: `arm-linux-gnueabihf-objdump -d`
+(binutils-arm-linux-gnueabihf is installed; plain `objdump` is
+x86-only). String lookup: `strings -t x <bin>` — for dispatch, .rodata
+VMA = file offset + 0x10000 (base 0x27508 @ 0x17508).
+
+**Windows PowerShell gotchas (cost real time):**
+- Multiline `git commit -m @'...'@` mangles the message into
+  pathspecs (PS 5.1 native-arg quoting). Use the Bash tool with a
+  heredoc: `git commit -F - <<'EOF' ... EOF`.
+- Remote ssh commands: write them as one single-quoted PS string.
+  `$(...)` inside must NOT be escaped — PS eats the backslash and
+  mangles it. For complex remote commands (nested quotes, parens in
+  grep -E), use the Bash tool instead — its quoting is reliable.
+- The app's remote sh is busybox ash: `grep -hE "9/1/8:(3[89]|4[0-9])"`
+  style patterns with parens survive only when quoted right — from the
+  Bash tool, not PS.
+
+**Camera-side observability:** the app writes rotating logs (~100 KB
+each) to `/tmp/sd/log/log1..5.txt`: every p2p command, dispatch
+handler, and rmm's day/night judge decisions with ms timestamps.
+ALWAYS grep these before RE'ing a behavior — the app's own command
+traffic is the fastest ground truth (the flashlight mapping came from
+here in minutes). WARNING: these logs contain the user's cloud-account
+credentials (inpwd/outbuf in webapi_do_login lines) — never publish
+them; see PLAN.md's cloud-block item.
+
+**dispatch internals (RE'd 2026-08-29):** non-PIE binary, global
+struct at **0x3dab4** (.data). Slots: [0]=/ipc_dispatch mqd (the big
+switch's receive queue), [4..24]=the other ipc mqds, [28]=
+/ipc_dispatch_worker, [32]=config-struct pointer, [40]=/dev/cpld_periph
+fd, [44]=/dev/fh_pwm fd. Readable live as root:
+`dd if=/proc/$(pidof dispatch)/mem bs=1 skip=$((0x3dab4+N)) count=4 | od -tx1`.
+The command switch keys on the mqueue message's cmd u16 at offset 8
+(msg+8); envelope payloads start at msg+16 (msg+12 is the payload-size
+u32 in the 20-byte form).
+
+**DANGER — /dev/cpld_periph ioctl 0x7019 hangs** the kernel path and
+the camera watchdog-reboots (verified 2026-08-29, camera went down for
+~2 min). Never fire it; the white-LED ioctls worth using are
+0x701c/0x701b/0x7021/0x7022 (on/off). `src/cpldio/cpldio.c` is the
+probe tool — keep it off the SD (it lives in /tmp only).
+
+**Camera crash recovery:** the camera self-recovers via its watchdog —
+never "reboot the camera" yourself. Sequence that works: ping (kernel
+comes up first) → poll ssh with `-o ConnectTimeout=5` every ~10 s
+until dropbear answers → verify with `uptime` + `pidof`; auto-rtsp
+brings the chain up on its own. Don't ssh-flood the booting unit.

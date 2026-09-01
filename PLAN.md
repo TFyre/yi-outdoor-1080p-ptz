@@ -1,4 +1,4 @@
-# PLAN — current state and next steps (updated 2026-08-29)
+# PLAN — current state and next steps (updated 2026-09-01)
 
 This is the live plan. The user drives each step; nothing here is auto-approved.
 
@@ -395,6 +395,72 @@ envelopes were captured; grep for "WHITE_LED" / "white_led".
 toggles `lighton`/`lightoff`), CGI `light=on|off|auto` on the web pad
 (three buttons). Because the command is the app's own, the state is
 stable AND the YI app shows the change after its next config sync.
+
+## Next workstream: block the cloud (proposed — user drives)
+
+Once RTSP/ONVIF/web are the control planes there is no reason for the
+camera to talk to YI's cloud (logs show `webapi_do_login` /
+`on_line` heartbeats to `plt-api-de.xiaoyi.com` carrying uid+password
+— and the SD logs record those credentials in plaintext). Goal: a
+reversible SD-side kill switch, same pattern as `auto-rtsp`.
+
+**To investigate first:**
+- `cloudAPI` is a separate binary; `watch_process` may restart it.
+  Read `/backup/init.sh` (the app's init script, on the camera) for
+  the startup/watchdog wiring.
+- Does rmm/dispatch degrade if cloudAPI dies? (Expected: no — the
+  mqueue/IPC paths used by PTZ/light/save_config are all internal.)
+- Kernel capability: `iptables` present? (check `/proc/net/ip_tables_names`)
+
+**Mechanisms, in order of preference:**
+1. `boot.sh` kills `cloudAPI` (and optionally `p2p_tnp`) after boot;
+   neutralize the watchdog's restart of it once `watch_process`'s
+   config is understood.
+2. `/etc/hosts` rewrite on the ramdisk at boot: `*.xiaoyi.com` →
+   127.0.0.1 (belt and braces; check the app doesn't use hardcoded
+   IPs first).
+3. iptables DROP if the kernel supports it.
+
+**Shape:** opt-in flag file `/tmp/sd/hack/block-cloud` (mirrors
+`auto-rtsp`), default off until the user confirms the offline stack is
+complete. Acceptance: no new xiaoyi traffic in the SD logs; RTSP /
+ONVIF / web pad / PTZ / flashlight all unaffected.
+
+## Repo reorganization for open-sourcing (proposed — user reviews)
+
+Current pain points: no LICENSE or README; `src/ring-capture/` has
+parallel-session scratch with untracked binaries; the real docs
+(`fshare-protocol.md`) are trapped inside the gitignored `analysis/`
+heap; and `deploy/hack/root/.ssh/authorized_keys` (a personal pubkey)
+is tracked. (The stray root capture `cap60tfyre.h264` was removed
+2026-09-01.)
+
+**Proposed layout:**
+```
+README.md         — what this is, camera facts summary, build (WSL Ubuntu)
+                    + deploy steps, links into docs/
+LICENSE           — GPL-3.0 (matches upstream yi-hack-v5 and the file headers)
+docs/             — fshare-protocol.md + PTZ/flashlight RE write-ups
+                    (moved out of analysis/, gitignore exceptions adjusted)
+deploy/hack/      — the SD tree; authorized_keys becomes
+                    authorized_keys.example, the real file gitignored
+src/<tool>/       — unchanged
+tools/            — build scripts + vendor patches
+analysis/         — stays a gitignored scratch area (probably NOT
+                    published: firmware dumps, ring snapshots, logs)
+PLAN.md           — stays at root (Claude's live plan)
+```
+
+**Steps (in order):**
+1. LICENSE + README.
+2. authorized_keys → example (gitignore the real one).
+3. Move the write-ups out of analysis/ into docs/.
+4. Sweep strays: `cap60tfyre.h264`, `src/ring-capture/` binaries →
+   into analysis/ (or delete, user decides); extend `.gitignore`
+   (`src/cpldio/cpldio`, `src/ring-capture/*`, root `*.h264`).
+5. Pre-publication audit: grep for personal info (SSID, keys, account
+   IDs — the SD logs are NOT in git but PLAN.md/CLAUDE.md examples
+   must be checked), confirm no firmware dumps are tracked.
 
 ## Camera state caveats for the fresh session
 
