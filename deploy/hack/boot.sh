@@ -88,7 +88,8 @@ fi
 if [ -f $HACK/block-cloud ]; then
   killall watch_process 2>/dev/null
   killall cloud cloudAPI p2p_tnp 2>/dev/null
-  if ! grep -q "wp_cmd.block" /proc/mounts; then
+  # /proc/mounts shows the TARGET, not the source path — match that
+  if ! grep -q " /home/app/wp_cmd " /proc/mounts; then
     mount -o bind $HACK/etc/wp_cmd.block /home/app/wp_cmd
   fi
   (cd /home/app && ./watch_process >/dev/null 2>&1 &)
