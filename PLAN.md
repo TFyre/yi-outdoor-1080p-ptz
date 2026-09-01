@@ -208,7 +208,7 @@ upstream server's audio path is ready and gated on a fifo:
 AAC), added as a substream of the same session. Nothing wrote that
 fifo — the producer filtered the ring for hi-res video only.
 
-**The unknowns resolved from the ring snapshots** (`analysis/audio_probe.py`,
+**The unknowns resolved from the ring snapshots** (`tools/audio_probe.py`,
 ring_n.bin + ring_now2.bin, 1203 audio records): every 0x0100 record's
 payload is already ONE COMPLETE ADTS frame — the app writes MPEG-2 ADTS
 directly, so the producer needs no re-framing, and there is no separate
@@ -495,41 +495,50 @@ would bypass the /etc/hosts sink. Low priority: the kill-based block
 makes respawns impossible, and 43 min of live observation shows zero
 traffic.
 
-## Repo reorganization for open-sourcing (proposed — user reviews)
+## Repo reorganization for open-sourcing (EXECUTED 2026-09-01; publication user-gated)
 
-Current pain points: no LICENSE or README; `src/ring-capture/` has
-parallel-session scratch with untracked binaries; the real docs
-(`fshare-protocol.md`) are trapped inside the gitignored `analysis/`
-heap; and `deploy/hack/root/.ssh/authorized_keys` (a personal pubkey)
-is tracked. (The stray root capture `cap60tfyre.h264` was removed
-2026-09-01.)
+Decisions taken: **GPL-3.0-or-later**; keep the real author identity on
+commits (already used on other projects); **no history squash** — the
+113-commit RE narrative is published as-is, with a surgical filter-repo
+pass (below) instead of a rewrite.
 
-**Proposed layout:**
-```
-README.md         — what this is, camera facts summary, build (WSL Ubuntu)
-                    + deploy steps, links into docs/
-LICENSE           — GPL-3.0 (matches upstream yi-hack-v5 and the file headers)
-docs/             — fshare-protocol.md + PTZ/flashlight RE write-ups
-                    (moved out of analysis/, gitignore exceptions adjusted)
-deploy/hack/      — the SD tree; authorized_keys becomes
-                    authorized_keys.example, the real file gitignored
-src/<tool>/       — unchanged
-tools/            — build scripts + vendor patches
-analysis/         — stays a gitignored scratch area (probably NOT
-                    published: firmware dumps, ring snapshots, logs)
-PLAN.md           — stays at root (Claude's live plan)
-```
+**Done:**
+1. `LICENSE` (canonical GPL-3.0 text) + SPDX headers on all `src/`,
+   `tools/`, and `deploy/hack/` sources (`tools/vendor/` stays LGPL-3.0+
+   with live555's own headers; README notes the mix).
+2. `README.md` — what/why, device facts, features, build + install,
+   a **Related projects** section (yi-hack-v5 + issue #457, the three
+   Allwinner ports, MStar port, live555) that absorbed the unique links
+   from `docs/plan.md`, license section, brick disclaimer.
+3. `deploy/hack/root/.ssh/authorized_keys` → `authorized_keys.example`
+   (real key gitignored); `boot.sh` installs the key only if the file
+   exists (a fresh clone just boots with ssh auth off).
+4. Moves out of `analysis/`: `fshare-protocol.md` → `docs/`,
+   `audio_probe.py` / `verify_fshare_map.py` / `slotwatch.c` → `tools/`;
+   all internal references updated; the analysis/ gitignore exceptions
+   removed. `docs/plan.md` (early-phase roadmap, superseded) deleted.
+5. `src/onvif/onvif.c`: the hardcoded 10.1.2.19 is gone — `mk_ip()`
+   reads wlan0 via `SIOCGIFADDR`, refreshed per request (wlan0 may not
+   be up when the daemon starts, and DHCP can move it). Built
+   ARMv6-clean. **Deploying the new onvif to the SD is user-driven.**
+6. `.gitignore`: `deploy/hack/root/.ssh/authorized_keys`, root
+   `/*.h264` and `/*.aac` strays.
 
-**Steps (in order):**
-1. LICENSE + README.
-2. authorized_keys → example (gitignore the real one).
-3. Move the write-ups out of analysis/ into docs/.
-4. Sweep strays: `cap60tfyre.h264`, `src/ring-capture/` binaries →
-   into analysis/ (or delete, user decides); extend `.gitignore`
-   (`src/cpldio/cpldio`, `src/ring-capture/*`, root `*.h264`).
-5. Pre-publication audit: grep for personal info (SSID, keys, account
-   IDs — the SD logs are NOT in git but PLAN.md/CLAUDE.md examples
-   must be checked), confirm no firmware dumps are tracked.
+**Pre-publication audit (done 2026-09-01):** the whole history (113
+commits, all blobs) contains no firmware dumps, ring snapshots,
+captures, logs, credentials, SSIDs, or private keys — the file
+inventory is today's tree plus 3 deleted innocuous scripts. The only
+personal items ever in git: the pubkey (handled above) and the author
+line (intentional).
+
+**Remaining (user-gated):**
+1. filter-repo pass, once, before the first push: `--replace-text` the
+   pubkey line → placeholder (removes it from every historical blob)
+   and inject `LICENSE` into the ROOT commit's tree (all descendants
+   inherit it, so every snapshot in the published history is
+   license-clean).
+2. Create the GitHub repo (empty, no auto-init) and push once.
+   No force-push is ever needed after that.
 
 ## Camera state caveats for the fresh session
 

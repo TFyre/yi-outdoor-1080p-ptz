@@ -192,7 +192,7 @@ observation is the `0x20` flag, and `26 + len` is always the exact stride.
 
 ### Validation (DATA)
 
-`analysis/verify_fshare_map.py` walks a snapshot from `hdr[0x10]` for exactly
+`tools/verify_fshare_map.py` walks a snapshot from `hdr[0x10]` for exactly
 `hdr[0x04]` bytes using this framing. On `ring_n.bin` and `ring_l.bin`:
 
 ```
@@ -284,7 +284,7 @@ Live slot filters right now: `slot[0]=0x0200`, `slot[1]=0x0D00`
 
 ### The stock readers are registered but idle (DATA)
 
-`analysis/slotwatch.c` samples the slot table every 2 ms, read-only. Over 12 s
+`tools/slotwatch.c` samples the slot table every 2 ms, read-only. Over 12 s
 (5161 samples) while the writer was producing normally:
 
 ```
@@ -768,14 +768,14 @@ arm-linux-musleabi-objdump -d analysis/tserver.bin > /tmp/tserver.dis
 arm-linux-musleabi-objdump -d analysis/rmm.bin     > /tmp/rmm.dis
 
 # framing validation against snapshots
-python3 analysis/verify_fshare_map.py ring_n.bin ring_l.bin
+python3 tools/verify_fshare_map.py ring_n.bin ring_l.bin
 
 # live header + slot table, read-only, no tools needed on the camera
 ssh ... "dd if=/dev/shm/fshare_frame_buf bs=1 count=300 2>/dev/null | od -A d -t u4"
 
 # live slot activity, read-only (build with tools/build-armv6.sh's toolchain)
 arm-linux-musleabi-gcc -O2 -static -no-pie -march=armv6 -mfloat-abi=soft \
-    -o slotwatch analysis/slotwatch.c
+    -o slotwatch tools/slotwatch.c
 ```
 
 ARM A32 PC-relative reminder for checking the citations: for `ldr rX,[pc,#N]`

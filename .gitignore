@@ -1,12 +1,8 @@
 backup/
 
 # analysis/ is a scratch area: firmware dumps, ring snapshots, decoded h264.
-# Ignore its contents, but keep the write-ups and the small tools they cite.
-analysis/*
-!analysis/*.md
-!analysis/verify_fshare_map.py
-!analysis/slotwatch.c
-!analysis/audio_probe.py
+# Write-ups and tools formerly here now live in docs/ and tools/.
+analysis/
 
 # build artifacts (reproducible via tools/build-*.sh in WSL)
 src/fshare2fifo/fshare2fifo
@@ -15,6 +11,12 @@ tools/probe-vfp
 tools/probe-vfp2
 deploy/hack/bin/
 deploy/hack/etc/dropbear/ecdsa.key
+# the user's own SSH pubkey (see authorized_keys.example in that dir)
+deploy/hack/root/.ssh/authorized_keys
+
+# stray captures dumped to the repo root by accident
+/*.h264
+/*.aac
 src/ptz/ptz
 deploy/hack/www/cgi-bin/ptz.cgi
 src/onvif/onvif

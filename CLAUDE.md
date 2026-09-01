@@ -88,10 +88,14 @@ on the SD root is a one-liner that execs `hack/boot.sh` at every boot.
   (the same binary under a name whose comm fits pidof; argv[0] dispatch
   turns on audio mode), rRTSPServer.
 - `hack/root/.ssh/authorized_keys` — pubkeys boot.sh installs to
-  `/root/.ssh/` each boot (the ramdisk resets).
+  `/root/.ssh/` each boot (the ramdisk resets). The repo ships only
+  `authorized_keys.example`; the real file is gitignored and must exist
+  locally for ssh auth (boot.sh skips the install if it is absent).
 - `hack/etc/dropbear/ecdsa.key` — host key (gitignored; boot.sh regenerates
   onto the SD if missing).
-- Repo layout: `deploy/hack/` mirrors the SD folder. Deploying: tar it up,
+- Repo layout: `deploy/hack/` mirrors the SD folder; `docs/` holds the
+  RE write-ups (fshare-protocol.md); `README.md` is the public face
+  (license GPL-3.0-or-later, related projects). Deploying: tar it up,
   scp to `/tmp`, untar in tmpfs, `cp -r` onto the SD (vfat: no chmod, no
   symlinks — tar extraction onto vfat works but modes are ignored; scripts
   are invoked as `sh <script>`).
@@ -163,7 +167,7 @@ sprint). Per-second diagnostics:
 `F2F_AGELOG=1` logs pos/head/dist/emission/block stats.
 
 **The fshare protocol (fully reverse-engineered 2026-08-25/26, commits
-57e4e2d/b65159d — the authoritative spec is `analysis/fshare-protocol.md`)**: the
+57e4e2d/b65159d — the authoritative spec is `docs/fshare-protocol.md`)**: the
 ring is a sequence-numbered RECORD LOG, not a byte stream. The mapping is a
 300-byte header + a 0x1B4000-byte ring: 0x00 active-reader count, 0x04 valid
 bytes, 0x0C head = (tail + valid) mod ring (derived), 0x10 tail, 0x14 newest
@@ -304,7 +308,7 @@ payloads. `rtsp://10.1.2.19/ch0_2.h264` is the audio-only stream;
 ch0_0/ch0_1 interleave it. Verified offline: the walk's exact ADTS
 output decodes 0 errors, and a native server run fed from the fifo
 logged "profile 1 … 16000 … channel_configuration 1" with a clean
-ffmpeg RTSP capture. Offline repro for audio: `analysis/audio_probe.py`
+ffmpeg RTSP capture. Offline repro for audio: `tools/audio_probe.py`
 (snapshot record stats) and a WSL x86 `fshare2fifo -a -n -o out.aac` on
 a snapshot copied to `/dev/shm/fshare_frame_buf` (the -n budget must be
 ≤ the records available — on a static snapshot video -n hangs waiting
