@@ -1,5 +1,7 @@
 # yi-hack for the YI Outdoor 1080p PTZ (Fullhan FH8626V100)
 
+[![build](https://github.com/TFyre/yi-outdoor-1080p-ptz/actions/workflows/build.yml/badge.svg)](https://github.com/TFyre/yi-outdoor-1080p-ptz/actions/workflows/build.yml)
+
 A yi-hack-v5-style firmware mod for the **YI Outdoor 1080p PTZ** camera
 (the `b221fp` board, Fullhan **FH8626V100** SoC): RTSP streaming, SSH, a
 web UI, PTZ control, ONVIF, and an opt-in cloud kill switch — all running
