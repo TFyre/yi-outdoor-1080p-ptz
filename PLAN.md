@@ -396,35 +396,87 @@ toggles `lighton`/`lightoff`), CGI `light=on|off|auto` on the web pad
 (three buttons). Because the command is the app's own, the state is
 stable AND the YI app shows the change after its next config sync.
 
-## Next workstream: block the cloud (proposed — user drives)
+## Workstream: block the cloud (RECON + IMPLEMENTED 2026-09-01 — activation is user-driven)
 
-Once RTSP/ONVIF/web are the control planes there is no reason for the
-camera to talk to YI's cloud (logs show `webapi_do_login` /
-`on_line` heartbeats to `plt-api-de.xiaoyi.com` carrying uid+password
-— and the SD logs record those credentials in plaintext). Goal: a
-reversible SD-side kill switch, same pattern as `auto-rtsp`.
+Recon done, mechanism implemented and deployed INERT; nothing is
+active until the user creates the flag and reboots.
 
-**To investigate first:**
-- `cloudAPI` is a separate binary; `watch_process` may restart it.
-  Read `/backup/init.sh` (the app's init script, on the camera) for
-  the startup/watchdog wiring.
-- Does rmm/dispatch degrade if cloudAPI dies? (Expected: no — the
-  mqueue/IPC paths used by PTZ/light/save_config are all internal.)
-- Kernel capability: `iptables` present? (check `/proc/net/ip_tables_names`)
+**Recon findings (all verified live 2026-09-01):**
 
-**Mechanisms, in order of preference:**
-1. `boot.sh` kills `cloudAPI` (and optionally `p2p_tnp`) after boot;
-   neutralize the watchdog's restart of it once `watch_process`'s
-   config is understood.
-2. `/etc/hosts` rewrite on the ramdisk at boot: `*.xiaoyi.com` →
-   127.0.0.1 (belt and braces; check the app doesn't use hardcoded
-   IPs first).
-3. iptables DROP if the kernel supports it.
+- `cloud` (59 KB, /home/app) is the resident cloud client; it execs
+  ONE-SHOT `/home/app/cloudAPI -c <cmd> -url ...` processes per webapi
+  call (log: `cloud.c(webapi_do_event_upload-3218)
+  cmd=/home/app/cloudAPI -c 411 -url ...`). Observed cmd ids: 411
+  (event upload), 304/306 (event update), 136/138/141/142, 422.
+- `watch_process` (9.5 KB) checks every 10 s and re-runs each watched
+  process's cmd from `/home/app/wp_cmd` (ro squashfs): dispatch→restart,
+  cloud→restart, rmm→REBOOT, p2p_tnp→restart, mp4record→restart,
+  oss→restart. It links `/dev/pid_list` (pid_list.ko misc device) —
+  cloud/p2p_tnp/watch_process all hold it open — and logs "X crashed!"
+  then runs the wp_cmd cmd. Killing cloud is PROVEN safe: the logs show
+  cloud+p2p_tnp "crashed!" several times historically (8/31 14:39,
+  9/1 8:08, 9/1 8:50) with only a restart, never a reboot, and no app
+  degradation. `/home/app/localbin/reboot_by_watchdog` exists (the
+  rmm-death path).
+- **No iptables in the kernel** (`/proc/net/ip_tables_names` missing) —
+  mechanism 3 dead. Kernel is **4.9.129**; file bind mounts work
+  (tested live with an identical wp_cmd copy, self-reversing).
+- The whole observed cloud surface is 4 hostnames:
+  `plt-api-de.xiaoyi.com` (API), `plt-api.xiaoyi.com` (fallback),
+  `log.eu.xiaoyi.com` (log uploads), `motiondetection-eu-1d.oss-eu-
+  central-1.aliyuncs.com` (event uploads). `/tmp/mmap.info` (tmpfs,
+  shared config) holds the API + log URLs.
+- Clock: `/dev/rtc` exists but hwclock reads 2059 (no battery), so the
+  app syncs time in software (rmm has `settimeofday` +
+  `send_set_time_msg`; cloud/p2p push it). Router 10.1.2.254 serves no
+  NTP. Blocking cloud therefore loses the clock → replaced by busybox
+  ntpd (the deployed /bin/busybox1.36.1 is busybox 1.38.0 full applets,
+  incl. ntpd/rdate).
+- cloud/cloudAPI/p2p_tnp are UPX-packed; unpacking needs upx (download
+  pending user approval — classifier-blocked) → the hardcoded-IP check
+  is still open. Observed behavior is all DNS-based (log lines carry
+  hostnames), so hosts sinking should cover; the acceptance test will
+  confirm.
 
-**Shape:** opt-in flag file `/tmp/sd/hack/block-cloud` (mirrors
-`auto-rtsp`), default off until the user confirms the offline stack is
-complete. Acceptance: no new xiaoyi traffic in the SD logs; RTSP /
-ONVIF / web pad / PTZ / flashlight all unaffected.
+**Mechanism (implemented + deployed 2026-09-01, INERT until flagged):**
+
+`deploy/hack/boot.sh` section 7, gated on `/tmp/sd/hack/block-cloud`:
+1. `killall watch_process`, then kill `cloud cloudAPI p2p_tnp`.
+2. Bind-mount `$HACK/etc/wp_cmd.block` (the wp_cmd without the
+   cloud/p2p_tnp entries; dispatch/rmm/mp4record/oss kept, **rmm→reboot
+   preserved**) over `/home/app/wp_cmd`, then restart watch_process on
+   the shadow — the respawn is neutralized, the self-recovery is not.
+3. Append the 4 hostnames → 127.0.0.1 to the ramdisk /etc/hosts
+   (belt-and-braces: covers cloudAPI processes anyone else execs,
+   e.g. log_server's log uploads).
+4. Start `ntpd -p pool.ntp.org -p time.cloudflare.com` (clock
+   replacement; retries on its own until wlan is up).
+All idempotent (mounts/hosts/pidof guards); un-flag + reboot = stock.
+
+Deployed to the SD (md5-checked: boot.sh d17b4076, wp_cmd.block
+0393299c). Flag file NOT created.
+
+**ACTIVATED + VERIFIED LIVE (2026-09-01):** the user created the flag
+and rebooted (~12:54). All checks pass: of the blocked set only
+watch_process runs (no cloud/p2p_tnp/cloudAPI — zero cloudAPI execs
+this boot); /home/app/wp_cmd shows the shadow via the vfat bind mount;
+marker + hosts sink present; clock synced by ntpd; netstat shows only
+LAN clients (2× RTSP 554, ssh, telnet). The only xiaoyi refs in the
+post-boot logs are two `[./dispatch]` config echoes at boot+15 s
+(epoch-time, pre-sink; no traffic). Found + fixed a boot.sh
+idempotency bug: busybox applets (ntpd/httpd) carry comm
+`busybox1.36.1`, so `pidof` never matches them — both guards now use
+`ps | grep -q "[n]tpd"`-style patterns (fixed boot.sh eefd99a8
+deployed; a live section re-run left exactly one ntpd/httpd/
+watch_process). **Hand-checks by the user (2026-09-01, all pass):**
+RTSP playback ✓, PTZ ✓, flashlight ✓, web pad ✓, YI app shows the
+camera offline ✓ (by design). Final battery (13:16, 21 min up): 0
+cloud/p2p/cloudAPI processes, exactly one watch_process + one ntpd,
+chain up, no external connections, and a functional sink proof —
+`wget http://plt-api-de.xiaoyi.com/` from the camera resolves to
+127.0.0.1 and refuses. The only post-boot cloud refs remain the two
+dispatch config echoes. Un-flag + reboot restores stock. The ffplay
+latency recipes live in CLAUDE.md's RTSP section.
 
 ## Repo reorganization for open-sourcing (proposed — user reviews)
 

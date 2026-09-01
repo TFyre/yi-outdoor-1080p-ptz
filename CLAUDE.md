@@ -55,9 +55,17 @@ on the SD root is a one-liner that execs `hack/boot.sh` at every boot.
   busybox (full applets) into `/bin` (ramdisk, redone each boot), starts
   telnetd 9999 + dropbear 2222 (pidfile-guarded), creates the
   dropbearmulti applet symlinks `/bin/scp` and `/bin/dbclient` (client-side
-  `scp -O` execs a remote `scp -t`, which must resolve to something), then
-  spawns `start-rtsp.sh` detached (the stock boot may wait for debug.sh to
-  return).
+  `scp -O` execs a remote `scp -t`, which must resolve to something), starts
+  the web pad (busybox httpd, 8080) and ONVIF (8082), then spawns
+  `start-rtsp.sh` detached (the stock boot may wait for debug.sh to
+  return). **Cloud block** (opt-in via `$HACK/block-cloud`, active since
+  2026-09-01): kills `cloud`/`cloudAPI`/`p2p_tnp`, bind-mounts
+  `etc/wp_cmd.block` over `/home/app/wp_cmd` and restarts watch_process
+  on the shadow (keeps the rmm→reboot entry), sinks the 4 cloud
+  hostnames in `/etc/hosts`, starts busybox ntpd for the clock.
+  Un-flag + reboot = stock. Applet liveness guards must be
+  `ps | grep -q "[n]tpd"` style — `pidof` never matches busybox
+  applets (their comm is `busybox1.36.1`).
 - `hack/start-rtsp.sh` — waits for `/dev/shm/fshare_frame_buf` (the app
   creates it once the camera pipeline is up), then starts the chain in
   this order: **f2f_audio first** (ADTSAudioFifoSource::createNew sits in
@@ -111,6 +119,17 @@ sed-fixes it; the fifo EAGAIN fix lives in `tools/vendor/`.
 The chain is reboot-persistent: `hack/start-rtsp.sh` brings it up at every
 boot (spawned by `hack/boot.sh`). Restart it manually with
 `sh /tmp/sd/hack/start-rtsp.sh`.
+
+**Client playback (the user's two recipes, verified 2026-09-01)** —
+`ch0_0`/`ch0_1` carry video+audio interleaved (`ch0_2` audio-only).
+The source runs ~19.5 fps, so players assuming 25/30 fps look fast —
+see the `-framerate 20` note in PLAN.md. Latency trade-off:
+
+- low latency (sub-second): `ffplay -rtsp_transport tcp -fflags nobuffer
+  -flags low_delay -probesize 32 -analyzeduration 0 -framedrop -sync ext
+  -i rtsp://10.1.2.19/ch0_0.h264`
+- high latency (smoothest playback): `ffplay -rtsp_transport tcp -i
+  rtsp://10.1.2.19/ch0_0.h264`
 
 **Join quality**: fshare2fifo waits for a complete SPS→PPS→IDR chain
 before emitting, converts the ring's 3-byte NAL start codes to **4-byte**
@@ -361,6 +380,12 @@ VMA = file offset + 0x10000 (base 0x27508 @ 0x17508).
 - The app's remote sh is busybox ash: `grep -hE "9/1/8:(3[89]|4[0-9])"`
   style patterns with parens survive only when quoted right — from the
   Bash tool, not PS.
+- **pidof gotcha**: pidof matches comm, and busybox multi-call applets
+  (httpd, ntpd, telnetd, ...) all carry comm `busybox1.36.1` (the
+  executed file's name) — `pidof httpd` / `pidof ntpd` NEVER match.
+  Use `ps | grep -q "[h]ttpd"`-style bracket patterns for applet
+  liveness checks; pidof works only for real binaries (onvif,
+  fshare2fifo, f2f_audio, rRTSPServer, ...).
 
 **Camera-side observability:** the app writes rotating logs (~100 KB
 each) to `/tmp/sd/log/log1..5.txt`: every p2p command, dispatch

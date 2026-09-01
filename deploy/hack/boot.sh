@@ -60,7 +60,8 @@ fi
 
 # 5. Web UI (PTZ pad + CGI) on 8080 — tiny, always on. The CGI drives
 #    the motor through the app's own mqueue (see src/ptz/).
-if ! pidof httpd >/dev/null; then
+#    ps+grep, not pidof: busybox applets share the comm busybox1.36.1.
+if ! ps | grep -q "[h]ttpd"; then
   nohup /bin/busybox1.36.1 httpd -p 8080 -h $HACK/www >/tmp/httpd.log 2>&1 &
 fi
 
@@ -68,6 +69,37 @@ fi
 #    WS-Discovery yet - add manually in clients). See src/onvif/.
 if ! pidof onvif >/dev/null; then
   nohup $BIN/onvif -p 8082 >/tmp/onvif.log 2>&1 &
+fi
+
+# 7. Cloud block — OPT-IN via the flag file $HACK/block-cloud (mirrors
+#    auto-rtsp; remove the flag + reboot to restore stock). The camera's
+#    cloud client is /home/app/cloud (a resident dispatcher that execs
+#    one-shot cloudAPI processes per webapi call) plus p2p_tnp (phone-app
+#    P2P relay). Both are kept alive by watch_process, which checks every
+#    10 s and re-runs each process's cmd from /home/app/wp_cmd. That file
+#    sits on the ro squashfs, so it is shadowed: a copy WITHOUT the
+#    cloud/p2p_tnp entries is bind-mounted over it (file bind mount,
+#    verified on the 4.9.129 kernel), then watch_process is restarted on
+#    the shadow. Its rmm->reboot entry is kept — that watchdog is the
+#    camera's self-recovery, do not lose it. /etc/hosts sinks the
+#    observed cloud hostnames as belt-and-braces (covers cloudAPI
+#    processes anything else might exec, e.g. log uploads), and ntpd
+#    takes over the clock (the cloud used to sync it via rmm).
+if [ -f $HACK/block-cloud ]; then
+  killall watch_process 2>/dev/null
+  killall cloud cloudAPI p2p_tnp 2>/dev/null
+  if ! grep -q "wp_cmd.block" /proc/mounts; then
+    mount -o bind $HACK/etc/wp_cmd.block /home/app/wp_cmd
+  fi
+  (cd /home/app && ./watch_process >/dev/null 2>&1 &)
+  if ! grep -q "xiaoyi" /etc/hosts; then
+    echo "127.0.0.1 plt-api.xiaoyi.com plt-api-de.xiaoyi.com log.eu.xiaoyi.com motiondetection-eu-1d.oss-eu-central-1.aliyuncs.com" >> /etc/hosts
+  fi
+  # ps+grep, not pidof: busybox applets share the comm busybox1.36.1
+  if ! ps | grep -q "[n]tpd"; then
+    nohup /bin/busybox1.36.1 ntpd -p pool.ntp.org -p time.cloudflare.com >/tmp/ntpd.log 2>&1 &
+  fi
+  echo "[hack] block-cloud: cloud+p2p killed, watchdog shadowed, hosts sunk, ntpd up" > /tmp/block-cloud.log
 fi
 
 exit 0
