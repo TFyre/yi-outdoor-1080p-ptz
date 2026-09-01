@@ -367,7 +367,9 @@ Keep stock-firmware dumps out of git.
 
 **WSL (the build + RE environment):** the distro is **Ubuntu** (a
 `-d Debian` call fails with DISTRO_NOT_FOUND). Builds:
-`wsl.exe -d Ubuntu -- bash -lc "cd /mnt/c/myprogs/yi-outdoor-1080p-ptz && tools/build-armv6.sh <target>"`.
+`wsl.exe -d Ubuntu -- bash -lc "cd <repo-path> && tools/build-armv6.sh <target>"`
+(the build scripts locate the repo from their own path — no hardcoded
+REPO).
 ARM disassembly of pulled app binaries: `arm-linux-gnueabihf-objdump -d`
 (binutils-arm-linux-gnueabihf is installed; plain `objdump` is
 x86-only). String lookup: `strings -t x <bin>` — for dispatch, .rodata

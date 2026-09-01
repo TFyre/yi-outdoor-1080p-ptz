@@ -3,7 +3,7 @@
 # Native (x86_64) build of rRTSPServer for debugging under gdb in WSL.
 set -e
 
-REPO=/mnt/c/myprogs/yi-outdoor-1080p-ptz
+REPO=$(cd "$(dirname "$0")/.." && pwd)
 SRC=$REPO/analysis/upstream-yi-hack-v5/src/rRTSPServer
 LIVE=$SRC/live
 

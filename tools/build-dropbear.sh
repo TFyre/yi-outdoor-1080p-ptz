@@ -9,7 +9,7 @@
 # Usage: bash tools/build-dropbear.sh   (run in WSL)
 set -e
 
-REPO=/mnt/c/myprogs/yi-outdoor-1080p-ptz
+REPO=$(cd "$(dirname "$0")/.." && pwd)
 VER=2026.94
 SRCDIR=$HOME/build-armv6/src
 TC=$HOME/musl-tc/arm-linux-musleabi-cross

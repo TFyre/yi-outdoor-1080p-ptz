@@ -12,7 +12,7 @@
 # Usage: build-armv6.sh <fshare2fifo|rtspserver|all>
 set -e
 
-REPO=/mnt/c/myprogs/yi-outdoor-1080p-ptz
+REPO=$(cd "$(dirname "$0")/.." && pwd)
 TC=$HOME/musl-tc/arm-linux-musleabi-cross
 CROSS=$TC/bin/arm-linux-musleabi
 FLAGS="-march=armv6 -mfloat-abi=soft -static -Os"
