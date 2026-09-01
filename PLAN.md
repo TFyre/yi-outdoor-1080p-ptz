@@ -432,11 +432,10 @@ active until the user creates the flag and reboots.
   NTP. Blocking cloud therefore loses the clock → replaced by busybox
   ntpd (the deployed /bin/busybox1.36.1 is busybox 1.38.0 full applets,
   incl. ntpd/rdate).
-- cloud/cloudAPI/p2p_tnp are UPX-packed; unpacking needs upx (download
-  pending user approval — classifier-blocked) → the hardcoded-IP check
-  is still open. Observed behavior is all DNS-based (log lines carry
-  hostnames), so hosts sinking should cover; the acceptance test will
-  confirm.
+- cloud/cloudAPI/p2p_tnp are UPX-packed → the hardcoded-IP check is
+  still open (see the UPX backlog item below). Observed behavior is all
+  DNS-based (log lines carry hostnames), so hosts sinking should cover;
+  the acceptance test confirmed it.
 
 **Mechanism (implemented + deployed 2026-09-01, INERT until flagged):**
 
@@ -468,7 +467,11 @@ idempotency bug: busybox applets (ntpd/httpd) carry comm
 `busybox1.36.1`, so `pidof` never matches them — both guards now use
 `ps | grep -q "[n]tpd"`-style patterns (fixed boot.sh eefd99a8
 deployed; a live section re-run left exactly one ntpd/httpd/
-watch_process). **Hand-checks by the user (2026-09-01, all pass):**
+watch_process). A second guard fix followed (adca5b42): the mount
+guard must match the /proc/mounts TARGET (` /home/app/wp_cmd `), not
+the source path — the old pattern never matched and would stack a
+duplicate bind on every re-run. The 43-min follow-up check (13:38)
+was all green. **Hand-checks by the user (2026-09-01, all pass):**
 RTSP playback ✓, PTZ ✓, flashlight ✓, web pad ✓, YI app shows the
 camera offline ✓ (by design). Final battery (13:16, 21 min up): 0
 cloud/p2p/cloudAPI processes, exactly one watch_process + one ntpd,
@@ -477,6 +480,20 @@ chain up, no external connections, and a functional sink proof —
 127.0.0.1 and refuses. The only post-boot cloud refs remain the two
 dispatch config echoes. Un-flag + reboot restores stock. The ffplay
 latency recipes live in CLAUDE.md's RTSP section.
+
+## Backlog item: UPX unpack + hardcoded-IP sweep (needs download approval)
+
+cloud/cloudAPI/p2p_tnp are UPX-packed, so their hostnames and IP
+literals were never swept directly (everything observed came from the
+app logs + /tmp/mmap.info). To close the residual: download upx
+v4.2.4 (static Linux build from the github.com/upx/upx releases — the
+permission classifier blocks external executable downloads without
+explicit user sign-off; the user can grant it in settings or approve
+when asked), unpack copies in `analysis/app/`, re-run
+`analysis/strings-sweep.sh` on them, and check for hardcoded IPs that
+would bypass the /etc/hosts sink. Low priority: the kill-based block
+makes respawns impossible, and 43 min of live observation shows zero
+traffic.
 
 ## Repo reorganization for open-sourcing (proposed — user reviews)
 
