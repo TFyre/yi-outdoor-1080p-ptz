@@ -1,4 +1,5 @@
 /*
+ * SPDX-License-Identifier: GPL-3.0-or-later
  * onvif - minimal ONVIF Profile S server for the YI Outdoor 1080p PTZ.
  *
  * Hand-rolled SOAP (no gSOAP - far too heavy for this device): a small
@@ -37,6 +38,8 @@
 #include <mqueue.h>
 #include <sys/socket.h>
 #include <sys/select.h>
+#include <sys/ioctl.h>
+#include <net/if.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 
@@ -218,13 +221,34 @@ static void http_fault(int fd, const char *reason)
     http_reply(fd, body);
 }
 
+/* the camera's own wlan0 address. Refreshed per request: wlan0 may not
+ * be up when the daemon starts at boot, and DHCP can move the address. */
+static char g_ip[16] = "0.0.0.0";
+
+static void mk_ip(void)
+{
+    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+
+    if (fd >= 0) {
+        struct ifreq ifr;
+
+        memset(&ifr, 0, sizeof(ifr));
+        strncpy(ifr.ifr_name, "wlan0", IFNAMSIZ - 1);
+        if (ioctl(fd, SIOCGIFADDR, &ifr) == 0)
+            strncpy(g_ip,
+                    inet_ntoa(((struct sockaddr_in *)&ifr.ifr_addr)->sin_addr),
+                    sizeof(g_ip) - 1);
+        close(fd);
+    }
+}
+
 /* the XAddr base for capability replies */
 static char g_xaddr[128];
 
 static void mk_xaddr(void)
 {
-    snprintf(g_xaddr, sizeof(g_xaddr), "http://%s:%d",
-             "10.1.2.19", g_port);   /* TODO: real address discovery */
+    mk_ip();
+    snprintf(g_xaddr, sizeof(g_xaddr), "http://%s:%d", g_ip, g_port);
 }
 
 /* the camera's real MAC - HA appends it to the device name */
@@ -380,12 +404,13 @@ static void rsp_stream_uri(int fd)
     snprintf(g_resp, sizeof(g_resp),
              ENV_HEAD
              "<trt:GetStreamUriResponse><trt:MediaUri>"
-             "<tt:Uri>rtsp://10.1.2.19:554/ch0_0.h264</tt:Uri>"
+             "<tt:Uri>rtsp://%s:554/ch0_0.h264</tt:Uri>"
              "<tt:InvalidAfterConnect>false</tt:InvalidAfterConnect>"
              "<tt:InvalidAfterReboot>false</tt:InvalidAfterReboot>"
              "<tt:Timeout>PT10S</tt:Timeout>"
              "</trt:MediaUri></trt:GetStreamUriResponse>"
-             ENV_TAIL);
+             ENV_TAIL,
+             g_ip);
     http_reply(fd, g_resp);
 }
 
@@ -665,12 +690,12 @@ static void rsp_network_interfaces(int fd)
              "<tt:MTU>1500</tt:MTU></tt:Info>"
              "<tt:IPv4><tt:Enabled>true</tt:Enabled>"
              "<tt:Config><tt:Manual>"
-             "<tt:Address>10.1.2.19</tt:Address>"
+             "<tt:Address>%s</tt:Address>"
              "<tt:PrefixLength>24</tt:PrefixLength>"
              "</tt:Manual></tt:Config></tt:IPv4>"
              "</tds:NetworkInterfaces></tds:GetNetworkInterfacesResponse>"
              ENV_TAIL,
-             g_mac);
+             g_mac, g_ip);
     http_reply(fd, g_resp);
 }
 
@@ -749,6 +774,9 @@ static int handle_request(int fd)
         return 0;
     }
     body += (body[0] == '\r') ? 4 : 2;
+
+    /* fresh address per request (wlan0 may come up after the daemon) */
+    mk_xaddr();
 
     /* route on the SOAPAction header, fall back to the method tag */
     action = NULL;
