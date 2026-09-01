@@ -19,3 +19,11 @@ src/ptz/ptz
 deploy/hack/www/cgi-bin/ptz.cgi
 src/onvif/onvif
 src/cpldio/cpldio
+src/ring-capture/cap-timeline
+src/ring-capture/endprobe
+src/ring-capture/peek0401
+src/ring-capture/ring-capture
+src/ring-capture/scanprobe
+src/ring-capture/semprobe
+src/ring-capture/slotprobe
+src/ring-capture/typescan
