@@ -193,20 +193,26 @@ typedef struct {
 } rec_hdr;
 
 /* The record magic's high 16 bits are a family, not a constant: the
- * observed prefixes are 0x6a8c, 0x6a89, 0x6a8a (boot era) and 0x6a8f
- * (post-reboot) - only 0x6a8x is fixed. */
+ * observed prefixes are 0x6a8c, 0x6a89, 0x6a8a (boot era), 0x6a8f
+ * (post-reboot) and 0x6b01. */
 static int magic_ok(uint32_t m)
 {
     /* The record magic's hi16 drifts per writer era: 0x6a8a, 0x6a8c were
      * observed, and on 2026-08-27 the app's writer moved to 0x6a90
      * mid-uptime - the old 0x6a80..0x6a8f range rejected every record
      * of the new era and the walk stalled forever (0 emission while
-     * the seq counter kept marching). The prefix is not a class; the
-     * low bytes are writer/sequence noise, and the real torn-record
-     * protection is the cascade that follows this gate (len vs left and
-     * MAXPAY, seq vs newest, type vs filter, next-record magic). Accept
-     * any 0x6aXX so an era change can never stall the walk again. */
-    return (m >> 16) >= 0x6a00 && (m >> 16) <= 0x6aff;
+     * the seq counter kept marching). The 0x6aXX-only range lasted until
+     * 2026-11-21, when the writer moved to 0x6b01 (verified on a live
+     * snapshot: 486/486 records across every type, all 0x6b01). Same
+     * stall, but now the AUDIO producer emits nothing too, so the server
+     * blocks in the ADTS syncword scan on the empty audio fifo and never
+     * accepts a client - port 554 listens, every client sits unaccepted,
+     * no video at all. The prefix is not a class; the low bytes are
+     * writer/sequence noise, and the real torn-record protection is the
+     * cascade that follows this gate (len vs left and MAXPAY, seq vs
+     * newest, type vs filter, next-record magic). Accept the whole
+     * 0x6aXX + 0x6bXX band so an era change cannot stall the walk. */
+    return (m >> 16) >= 0x6a00 && (m >> 16) <= 0x6bff;
 }
 
 /* Is this record wanted by a slot with this cursor and filter? The
