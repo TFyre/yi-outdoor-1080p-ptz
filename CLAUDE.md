@@ -174,7 +174,11 @@ bytes, 0x0C head = (tail + valid) mod ring (derived), 0x10 tail, 0x14 newest
 record ts, 0x18 newest seq, then `reader_slot[17]` (stride 16: +0 pending,
 +4 waiting, +8 cursor, +12 filter). Records: 26-byte header (len@+0, seq@+4,
 magic@+8 — the two-byte shift that made the old +6 scans see "zero records"
-and invent the raw-Annex-B era — ts@+16, type@+20, chain-part@+22) + payload.
+and invent the raw-Annex-B era — cookie@+12, ts@+16, type@+20,
+chain-part@+22) + payload. **The magic is the record's WRITE TIME**, unix
+seconds truncated to 32 bits: its hi16 turns over every 65536 s (18.2 h), so
+reading it as a format or era tag rots — that gate stalled the chain on
+2026-08-27 and again on 2026-11-21 (see `docs/fshare-protocol.md`, `rec_ok()`).
 Types: 0x0100 audio, 0x0400 hi-res frame, 0x0800 low-res, chain parts
 0x0422/0x0401/0x0404 (hi) and 0x08xx (lo). The 0x0401 record carries the
 WHOLE GOP head (SPS+PPS+~20 zeros+IDR) in one payload; SPS/PPS NALs need
@@ -190,11 +194,12 @@ twice (the app's wake-then-inc post order vs ours corrupts the {0,1}
 invariant), leaving the lock held by nobody and stalling rmm's whole
 pipeline (H264_CB stuck in `down`; a reboot is the recovery). The lock-free
 walk is correct by the doc's own analysis: records with seq < hdr[0x18] are
-complete by construction; magic/stride validation stops the walk on anything
-torn; slot writes race benignly (the writer never reads cursors). The whole
-v1 machinery (diff sampler, shadows, tear checks, head estimation, MAX_LAG,
-re-joins, start-code ring scanning) is deleted — ~950 lines vs the walk's
-~3000.
+complete by construction; the successor rule (a record is real iff the header
+at `off + 26 + len` is the next record, seq+1) plus the stride check stop the
+walk on anything torn; slot writes race benignly (the writer never reads
+cursors). The whole v1 machinery (diff sampler, shadows, tear checks, head
+estimation, MAX_LAG, re-joins, start-code ring scanning) is deleted —
+~950 lines vs the walk's ~3000.
 
 **Ring format (reverse-engineered from live captures, commit 1677010)**:
 the ring carries TWO interleaved H.264 streams — the target 1920×1088
@@ -215,15 +220,15 @@ at ~440 KB/s; positional re-gates churn against that). Measured live:
 base: `analysis/s*.bin` snapshots, `tools/ringdiff.py`.
 
 **The record-framing (reverse-engineered from live snapshots 2026-08-24,
-commits f02fa63/c8437c4 — the producer's PRIMARY mode)**: the ring
-switches mid-uptime between the raw Annex-B mode above and a
-RECORD-framed mode whose every frame is a 24-byte header + a 4-byte-SC
-NAL (the magic's low byte is a writer sequence, not a class — classify
-by the TYPE):
+commits f02fa63/c8437c4; header layout CORRECTED 2026-11-21 against
+`docs/fshare-protocol.md` — the 24-byte layout first derived here was a
+two-byte-shifted misread)**: every record is a 26-byte header + a 4-byte-SC
+NAL (classify by the TYPE; the magic is the write clock, never a class):
 
-- header: `[0:2] u16 | [2:6] counter u32 (+1 per record, strictly
-  monotonic) | [6:10] magic u32 (mask 0xffff0000 == 0x6a8c0000) |
-  [10:14] u32 | [14:18] ts u32 | [18:20] type u16 | [20:22] sub u16`
+- header: `[0:4] len u32 | [4:8] seq u32 (+1 per record, ring-wide) |
+  [8:12] magic u32 = the record's WRITE TIME (unix seconds, 32-bit) |
+  [12:16] cookie | [16:20] ts u32 | [20:22] type u16 |
+  [22:24] chain-part u16 | [24:26] extra u16`
 - types: **0x0400 hi-res frame / 0x0800 low-res frame / 0x0100 audio
   (raw AAC, no SC, tail `00 00 ff f9`)** — the Allwinner flags — and
   the chain parts **0x0422 SPS#1 (SC at +30, after an 8-byte prefix) /
@@ -254,13 +259,13 @@ by the TYPE):
   in WSL and run the x86 build (`gcc -O0 -g` of the same source) —
   `-o out.h264` dumps the walk's exact emission for decode/diff.
 
-Note the ring format has MODES: transient boot-time record streams
-(26/34-byte headers with `6a 8a 33 f?` magics — an older record era)
-and the steady-state raw Annex-B mode above. The modes ALSO change
-mid-uptime: verified live that the c0 entries vanish while the encoder
-keeps running, and the header slots freeze when the writer reaches the
-buffer end — the ring-diff sampler in the producer tracks the writer
-through all of it (legacy; the record walk no longer needs it).
+Note: earlier notes described the ring as switching between a "raw
+Annex-B mode" and the record mode. The 2026-08-26 re-validation in
+`docs/fshare-protocol.md` settled it: **there is no raw Annex-B mode and
+there are no `00 00 01 c0` table entries** — every snapshot walks as
+records to an exact zero budget, and a scan that finds zero markers is
+looking at the wrong offset. The old "`6a 8a 33 f?` marker" reads as a plain
+2026-08-22 timestamp, which is exactly what that field is.
 
 **The delivery layer is exonerated (2026-08-25)**: with F2F_TEE set,
 the vendored ByteStreamFifoSource writes every byte it serves to a
