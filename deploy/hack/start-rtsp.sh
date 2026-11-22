@@ -32,7 +32,25 @@ PID=$(pidof fshare2fifo)
 [ -n "$PID" ] && kill $PID
 PID=$(pidof f2f_audio)
 [ -n "$PID" ] && kill $PID
-sleep 1
+
+# ...then WAIT until they are actually gone. The start loops below decide
+# "the producer is up" with pidof, so a process still in its graceful
+# shutdown makes them think it is already running: nothing gets started,
+# the fifos are removed anyway, and the new server then exits on the
+# missing audio fifo. Observed 2026-11-21: "rtsp chain up" logged, and an
+# empty process list seconds later. SIGKILL only if the handlers hang.
+w=0
+while [ $w -lt 10 ]; do
+  [ -z "$(pidof rRTSPServer fshare2fifo f2f_audio)" ] && break
+  sleep 1
+  w=$((w+1))
+done
+PID=$(pidof rRTSPServer fshare2fifo f2f_audio)
+if [ -n "$PID" ]; then
+  echo "old chain still alive after 10 s - forcing: $PID"
+  kill -9 $PID 2>/dev/null
+  sleep 1
+fi
 
 # AUDIO PRODUCER FIRST: ADTSAudioFifoSource::createNew sits in a syncword
 # scan until the audio fifo has a writer (it re-polls every 10 ms, but if
@@ -82,7 +100,15 @@ if [ -z "$PID" ]; then
   exit 1
 fi
 
-echo "rtsp chain up"
+# The server has no start loop of its own (it is started once, above), so
+# check it here: a fifo/open failure must not read as success. The watch
+# loop below respawns it if it dies later.
+sleep 1
+if [ -z "$(pidof rRTSPServer)" ]; then
+  echo "server never came up - see /tmp/rtsp.log"
+else
+  echo "rtsp chain up"
+fi
 
 # Watch loop: the producers are sitting ducks for the OOM killer (35 MB
 # RAM total; the app's encode bursts have SIGKILLed them - exit 137),
