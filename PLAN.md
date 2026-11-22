@@ -1,4 +1,4 @@
-# PLAN — current state and next steps (updated 2026-09-01)
+# PLAN — current state and next steps (updated 2026-11-22)
 
 This is the live plan. The user drives each step; nothing here is auto-approved.
 
@@ -15,6 +15,35 @@ This is the live plan. The user drives each step; nothing here is auto-approved.
   gitignored.
 - SD-folder deletions require explicit user confirmation.
 - Conventional Commits.
+
+## RTSP outage 2026-11-21 — FIXED + DEPLOYED: the +8 "magic" is the writer's clock
+
+The camera stopped serving video after a move to a different WiFi. The network
+was fine (ping, every port), the chain was up — but the server had never
+accepted a single client. Root cause was the producer's magic gate, not the
+network.
+
+- The record field at `+8` is **not** an era tag: it is the record's write
+  time, unix seconds truncated to 32 bits (authoritative write-up in
+  `docs/fshare-protocol.md`). Its hi16 turns over every 65536 s (18.2 h), so a
+  hard-coded "family" check rots on a calendar. Both producers rejected every
+  record (486/486 in the live ring) and emitted nothing; the audio fifo stayed
+  empty and `rRTSPServer` parked in its ADTS syncword scan — port 554
+  listening, nine clients queued, none accepted.
+- Commit `a9d9b94` widened the band to `0x6a00..0x6bff` (headroom to
+  2027-06-02 12:28:48Z), deployed and verified live.
+- Replaced the gate with the **successor rule** (`rec_ok`): the header at
+  `off + 26 + len` must be the next record — `seq + 1` plus a sane length. A
+  property of the data, not the clock, so it cannot rot. The magic is logged
+  once per claim (`record magic 0x... (writer clock)`) as a diagnostic.
+  Verified offline against both `analysis/` snapshots (the `0x6b01` and
+  `0x6a90` eras), then deployed and live-verified 2026-11-22 (OPTIONS 200,
+  both producers' slot cursors advancing).
+- **Known, NOT fixed:** `start-rtsp.sh`'s restart path can race its own kill —
+  its `pidof` start checks can match the dying old processes, so it starts
+  nothing, and the new server then opens a fifo the script already `rm`'d.
+  Workaround: wait for `pidof` to go empty before relaunching (done by hand on
+  2026-11-21 and 2026-11-22).
 
 ## Primary objective (IN PROGRESS): prove fshare2fifo's emission is clean
 

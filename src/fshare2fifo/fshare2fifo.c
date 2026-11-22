@@ -21,8 +21,10 @@
  * wakeup latency does.
  *
  * Record header (26 bytes): [0] len u32 (payload incl. extras prefix)
- * [4] seq u32 (+1 per record, ring-wide) [8] magic u32 [12] cookie
- * [16] ts u32 [20] type u16 [22] chain-part u16 [24] extra u16.
+ * [4] seq u32 (+1 per record, ring-wide) [8] magic u32 (the writer's
+ * CLOCK: unix seconds truncated to 32 bits - not a format tag, see
+ * rec_ok()) [12] cookie [16] ts u32 [20] type u16 [22] chain-part u16
+ * [24] extra u16.
  * Types: 0x0400 hi-res frame, 0x0422 hi SPS#1, 0x0401 hi SPS#2,
  * 0x0404 hi PPS (0x08xx = low-res, 0x0100 = audio - filtered out).
  * The payload carries a 4-byte start code after a 0/5/6-byte extras
@@ -163,7 +165,8 @@ static void slot_wr_u32(unsigned off, uint32_t v)
  *     seq < hdr[0x18] is COMPLETE by construction (only the newest
  *     record can be mid-copy). Consuming strictly older records is
  *     tear-free.
- *   - the walk validates each record's magic and stride; anything
+ *   - the walk validates each record by its SUCCESSOR (the header at
+ *     its end is the next record, seq + 1) and by stride; anything
  *     torn or stale stops the walk (retried on the next poll).
  *   - our slot writes (cursor/pending/filter) race benignly: the
  *     writer never reads a cursor, and a lost pending clear only
@@ -192,27 +195,40 @@ typedef struct {
     uint16_t type, chain, extra;            /* +20..+24 (26 bytes total) */
 } rec_hdr;
 
-/* The record magic's high 16 bits are a family, not a constant: the
- * observed prefixes are 0x6a8c, 0x6a89, 0x6a8a (boot era), 0x6a8f
- * (post-reboot) and 0x6b01. */
-static int magic_ok(uint32_t m)
+/* ---- record validity: the successor rule (§2, lock-free) ----
+ * The app writes one record at a time and seq increments by exactly 1
+ * per record (ring-wide, every type), so the record at `off` is
+ * provably COMPLETE once the header at its end is already the NEXT
+ * record: a sane length and seq + 1. A torn record, a stale region or
+ * a gap in the writer's progress fails that test and the walk stops
+ * for this poll (10 ms), retried from the published tail.
+ *
+ * This replaces the old magic gate. The record magic is not a format
+ * tag or an era prefix: it is the writer's CLOCK - unix seconds
+ * truncated to 32 bits - so its high 16 bits turn over every 65536 s
+ * (18 h 12 min) and any fixed family check rots. That gate stalled the
+ * whole chain on 2026-08-27 (0x6a90) and again on 2026-11-21 (0x6b01):
+ * zero emission, an empty audio fifo, and rRTSPServer parked in its
+ * ADTS syncword scan with no client ever accepted. seq + 1 cannot rot
+ * - it is a property of the data, not of the time of day. The magic is
+ * still logged once per claim as a diagnostic (see claim_slot). */
+static int rec_ok(uint32_t off, uint32_t left, rec_hdr *h)
 {
-    /* The record magic's hi16 drifts per writer era: 0x6a8a, 0x6a8c were
-     * observed, and on 2026-08-27 the app's writer moved to 0x6a90
-     * mid-uptime - the old 0x6a80..0x6a8f range rejected every record
-     * of the new era and the walk stalled forever (0 emission while
-     * the seq counter kept marching). The 0x6aXX-only range lasted until
-     * 2026-11-21, when the writer moved to 0x6b01 (verified on a live
-     * snapshot: 486/486 records across every type, all 0x6b01). Same
-     * stall, but now the AUDIO producer emits nothing too, so the server
-     * blocks in the ADTS syncword scan on the empty audio fifo and never
-     * accepts a client - port 554 listens, every client sits unaccepted,
-     * no video at all. The prefix is not a class; the low bytes are
-     * writer/sequence noise, and the real torn-record protection is the
-     * cascade that follows this gate (len vs left and MAXPAY, seq vs
-     * newest, type vs filter, next-record magic). Accept the whole
-     * 0x6aXX + 0x6bXX band so an era change cannot stall the walk. */
-    return (m >> 16) >= 0x6a00 && (m >> 16) <= 0x6bff;
+    rec_hdr nh;
+
+    if (left < 26 * 2)
+        return 0;
+    ring_copy(off, h, sizeof(*h));
+    if (h->len == 0 || h->len > MAXPAY || 26 + h->len > left)
+        return 0;
+    if (left < 26 + h->len + 26)
+        return 0;                   /* no room for a successor header */
+    ring_copy((off + 26 + h->len) % DATA_SZ, &nh, sizeof(nh));
+    if (nh.seq != h->seq + 1u)
+        return 0;                   /* torn/stale: no successor continuity */
+    if (nh.len == 0 || nh.len > MAXPAY)
+        return 0;
+    return 1;
 }
 
 /* Is this record wanted by a slot with this cursor and filter? The
@@ -740,8 +756,9 @@ static int emit_delivered(const uint8_t *p, uint32_t len, uint16_t type)
  * published tail. No locks are taken: records with seq strictly
  * below the published newest seq are complete by construction (the
  * writer publishes seq/valid/head BEFORE the record bytes, one
- * record at a time), and the magic/stride validation stops the walk
- * on anything torn. The slot writes race benignly. */
+ * record at a time), and the successor rule (rec_ok) plus the stride
+ * validation stop the walk on anything torn. The slot writes race
+ * benignly. */
 static void reader_loop(void)
 {
     static uint8_t *payload;
@@ -770,11 +787,8 @@ static void reader_loop(void)
 
             while (left > 26) {
                 rec_hdr h;
-                ring_copy(off, &h, sizeof(h));
-                if (!magic_ok(h.magic))
+                if (!rec_ok(off, left, &h))
                     break;             /* torn/stale: stop, retry next poll */
-                if (26 + h.len > left || h.len > MAXPAY)
-                    break;
                 if (h.seq == newest)
                     break;             /* the newest record may be mid-copy */
                 if (entry_wanted(slot_cursor, g_filter, &h)) {
@@ -845,9 +859,8 @@ static void reader_loop(void)
 
         /* Stall watchdog: the writer is flowing (valid moves) but we
          * have consumed nothing for a while. Re-anchor the cursor at
-         * the newest seq - covers magic-era drift and seq-era resets
-         * the walk's own checks missed (e.g. a prefix change outside
-         * the 0x6aXX family). If consecutive re-anchors bring no
+         * the newest seq - covers seq-era resets the walk's own checks
+         * missed. If consecutive re-anchors bring no
          * records back, the ring carries no records at all (the app
          * flipped to raw Annex-B, or a torn region never heals): exit
          * so start-rtsp.sh's watcher respawns us with a fresh claim. */
@@ -943,10 +956,7 @@ static int claim_slot(int want_slot)
             uint32_t newest = hdr_u32(HDR_SEQ);
             while (left > 26) {
                 rec_hdr h;
-                ring_copy(off, &h, sizeof(h));
-                if (!magic_ok(h.magic))
-                    break;
-                if (26 + h.len > left || h.len > MAXPAY)
+                if (!rec_ok(off, left, &h))
                     break;
                 if (h.seq == newest)
                     break;
@@ -973,6 +983,15 @@ static int claim_slot(int want_slot)
         slot_k = k;
         fprintf(stderr, "slot %d claimed (filter 0x%04x, cursor %u)\n",
                 k, g_filter, slot_cursor);
+        {
+            /* diagnostic: the record magic is the writer's clock (unix
+             * seconds), not a format tag - log it once per claim so a
+             * future framing change is visible without a rebuild */
+            rec_hdr d;
+            if (rec_ok(hdr_u32(HDR_TAIL), hdr_u32(HDR_VALID), &d))
+                fprintf(stderr, "record magic 0x%08x (writer clock)\n",
+                        d.magic);
+        }
         return 0;
     }
     fprintf(stderr, "no free slot in %d..%d\n", first, last);

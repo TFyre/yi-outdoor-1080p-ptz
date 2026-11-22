@@ -178,7 +178,7 @@ record starts at `off + 26 + len`, wrapping at 0x1B4000.
 |---|---|---|---|
 | +0 | u32 | payload length | ASM+DATA |
 | +4 | u32 | **sequence number**, +1 per record, ring-wide | ASM+DATA |
-| +8 | u32 | **magic** (`0x6a8c….`/`0x6a89….` family) | ASM(rmm) |
+| +8 | u32 | **write clock** — unix seconds truncated to 32 bits (see below) | ASM(rmm)+DATA |
 | +12 | u32 | **caller cookie** — `0x01c69010` on chain parts, 0 on plain frames | ASM(rmm) |
 | +16 | u32 | **timestamp**, same clock as header `0x14` | ASM+DATA |
 | +20 | u16 | **type** (see below); bit `0x20` = "payload has an extras prefix" | ASM+DATA |
@@ -189,6 +189,44 @@ record starts at `off + 26 + len`, wrapping at 0x1B4000.
 is 6, 5 or 0 selected by a subtype byte, and sets `type |= 0x20` when `fp != 0`
 (`0x5fe60: orr ip, ip, #32`). So the old "`0x0422` SPS#1 has an 8-byte prefix"
 observation is the `0x20` flag, and `26 + len` is always the exact stride.
+
+### +8 is the record's write clock, not an "era" tag
+
+The field at `+8` is not a magic number or a format tag: it is **the time the
+record was written**, unix seconds truncated to 32 bits. Its high 16 bits turn
+over every 65536 s (18 h 12 min 16 s), which is what earlier notes mistook for
+drifting "families" (`0x6a8a`, `0x6a8c`, `0x6a8f`, `0x6a90`, `0x6b01`) and for
+"writer sequence noise" in the low bytes.
+
+Verified against the two snapshots in `analysis/`, whose capture times are
+independently known:
+
+| Snapshot | Magic range | Decodes to (UTC) | Independent check |
+|---|---|---|---|
+| `ring-now.bin` | `0x6b01fb24..fb30` | 2026-11-21 20:12:20–32 | file mtime 21:12 local (UTC+1, winter) |
+| `ring-era90.bin` | `0x6a9003e4..f1` | 2026-08-27 09:31:16–29 | file mtime 11:31 local (UTC+2, summer) |
+
+A live read during the 2026-11-21 deploy matched too: `0x6b0224ef`
+= 1795302639, four seconds before the camera's `date +%s` = 1795302643.
+Within one snapshot the value is non-decreasing and spans only the ring's own
+duration — 13 distinct low-16 values over ~12 s at the observed bitrate.
+
+**DST is not involved.** The field is the epoch clock (`date +%s`), which has
+no timezone. The two local mtimes above sit 1 h and 2 h from UTC because of
+the local DST offset; the magic tracks UTC in both.
+
+**Why this matters:** a reader that gates on a magic "family" is really
+comparing dates, so the gate rots. `fshare2fifo` did exactly that and stalled
+the whole chain twice — on 2026-08-27 when the prefix moved to `0x6a90`
+(commit 2e0a314) and again on 2026-11-21 at `0x6b01`: zero emission, an empty
+audio fifo, and `rRTSPServer` parked in its ADTS syncword scan with every
+client left unaccepted on port 554.
+
+The producer now validates a record by its **successor** instead: the header
+at `off + 26 + len` must be the next record — `seq + 1` and a sane length.
+`seq + 1` is a property of the data, not of the clock, so it cannot rot. The
+magic is still logged once per claim (`record magic 0x... (writer clock)`) as
+a diagnostic, so a future framing change is visible without a rebuild.
 
 ### Validation (DATA)
 
