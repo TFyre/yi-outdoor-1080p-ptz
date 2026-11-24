@@ -76,28 +76,57 @@ if ! pidof onvif >/dev/null; then
   nohup $BIN/onvif -p 8082 >/tmp/onvif.log 2>&1 &
 fi
 
-# 7. Cloud block — OPT-IN via the flag file $HACK/block-cloud (mirrors
-#    auto-rtsp; remove the flag + reboot to restore stock). The camera's
-#    cloud client is /home/app/cloud (a resident dispatcher that execs
-#    one-shot cloudAPI processes per webapi call) plus p2p_tnp (phone-app
-#    P2P relay). Both are kept alive by watch_process, which checks every
-#    10 s and re-runs each process's cmd from /home/app/wp_cmd. That file
-#    sits on the ro squashfs, so it is shadowed: a copy WITHOUT the
-#    cloud/p2p_tnp entries is bind-mounted over it (file bind mount,
-#    verified on the 4.9.129 kernel), then watch_process is restarted on
-#    the shadow. Its rmm->reboot entry is kept — that watchdog is the
-#    camera's self-recovery, do not lose it. /etc/hosts sinks the
-#    observed cloud hostnames as belt-and-braces (covers cloudAPI
-#    processes anything else might exec, e.g. log uploads), and ntpd
-#    takes over the clock (the cloud used to sync it via rmm).
-if [ -f $HACK/block-cloud ]; then
+# 7. Process blocks — OPT-IN, composable flags (remove the flag + reboot
+#    to restore stock):
+#      $HACK/block-cloud -> cloud, cloudAPI, p2p_tnp
+#      $HACK/no-record   -> mp4record (+ its writes are redirected to RAM)
+#    Every blocked process is kept alive by watch_process, which checks
+#    every 10 s and re-runs each process's cmd from /home/app/wp_cmd.
+#    That file sits on the ro squashfs, so it is shadowed: a filtered
+#    copy (built at boot from the pristine $HACK/etc/wp_cmd.orig) is
+#    bind-mounted over it (file bind mount, verified on the 4.9.129
+#    kernel), then watch_process is restarted on the shadow. Its
+#    rmm->reboot entry is ALWAYS kept — that watchdog is the camera's
+#    self-recovery, do not lose it.
+WP_BLOCK=""
+[ -f $HACK/block-cloud ] && WP_BLOCK="$WP_BLOCK cloud cloudAPI p2p_tnp"
+[ -f $HACK/no-record ] && WP_BLOCK="$WP_BLOCK mp4record"
+
+if [ -n "$WP_BLOCK" ]; then
+  # kill first: a live recorder may hold an open file inside
+  # /tmp/sd/record, and it must be gone before the tmpfs overlay below
   killall watch_process 2>/dev/null
-  killall cloud cloudAPI p2p_tnp 2>/dev/null
-  # /proc/mounts shows the TARGET, not the source path — match that
-  if ! grep -q " /home/app/wp_cmd " /proc/mounts; then
-    mount -o bind $HACK/etc/wp_cmd.block /home/app/wp_cmd
+  for p in $WP_BLOCK; do killall $p 2>/dev/null; done
+  cp $HACK/etc/wp_cmd.orig /tmp/wp_cmd.shadow
+  for p in $WP_BLOCK; do sed -i "/$p/d" /tmp/wp_cmd.shadow; done
+  # /proc/mounts shows the TARGET, not the source path — match that.
+  # Unmount first (watch_process is already dead): a re-run must REPLACE a
+  # shadow left by an older boot.sh (e.g. wp_cmd.block), not keep it.
+  if grep -q " /home/app/wp_cmd " /proc/mounts; then
+    umount /home/app/wp_cmd 2>/dev/null
   fi
+  mount -o bind /tmp/wp_cmd.shadow /home/app/wp_cmd
   (cd /home/app && ./watch_process >/dev/null 2>&1 &)
+  echo "[hack] blocked:$WP_BLOCK (watchdog shadowed)" > /tmp/blocked.log
+fi
+
+# 7b. no-record: belt and braces — even if something else starts the
+#     recorder, its output lands in a 1 MB RAM filesystem, never on the
+#     SD. The stock app wrote ~12 GB of rolling 1-minute mp4 segments to
+#     /tmp/sd/record, which is what wore the card out. Keep it small: the
+#     box has 35 MB of RAM and the point is to make the writes fail fast.
+if [ -f $HACK/no-record ]; then
+  mkdir -p /tmp/sd/record
+  if ! grep -q " /tmp/sd/record " /proc/mounts; then
+    mount -t tmpfs -o size=1m tmpfs /tmp/sd/record
+  fi
+fi
+
+# 7c. Cloud extras — only with block-cloud: /etc/hosts sinks the observed
+#     cloud hostnames as belt-and-braces (covers cloudAPI processes
+#     anything else might exec, e.g. log uploads), and ntpd takes over
+#     the clock (the cloud used to sync it via rmm).
+if [ -f $HACK/block-cloud ]; then
   if ! grep -q "xiaoyi" /etc/hosts; then
     echo "127.0.0.1 plt-api.xiaoyi.com plt-api-de.xiaoyi.com log.eu.xiaoyi.com motiondetection-eu-1d.oss-eu-central-1.aliyuncs.com" >> /etc/hosts
   fi
