@@ -45,6 +45,38 @@ network.
   Workaround: wait for `pidof` to go empty before relaunching (done by hand on
   2026-11-21 and 2026-11-22).
 
+## Recording disable + stock-system RE (2026-11-24)
+
+Camera came back in **stock mode** after a power cut + a manual `reboot`: the
+SD hack never started, while the stock app ran normally and the card stayed
+mounted and writable — proved by the app's own diagnostic snapshots, which
+landed on the card at 16:42/16:43/19:01. The card's hack tree is complete
+and every hash matches the deployed builds (`start-rtsp.sh 59466694`,
+producers `6db25b25`, busybox `5fb17b86`), so **content is not the cause**;
+card I/O reliability is the remaining suspect (the reader needed several
+insertions). `badblocks` was still running at the end of the session.
+
+- `docs/stock-system.md` now records the boot chain (`/backup/init.sh`
+  mounts the card, `checkdisk` fsck's it, `lower_half_init.sh` ends with
+  `sh /tmp/sd/debug.sh`), the stock inetd services, the
+  **no-root-password** finding (no `/etc/shadow` anywhere — the port-23
+  telnet login can never authenticate), `checkdisk`'s fdisk+mkfs repair
+  path (do not power-cycle a "bad" card), the recording behaviour, and the
+  rootfs extraction recipe.
+- `boot.sh` reworked: the watch_process shadow is now built at boot from
+  `etc/wp_cmd.orig` (pristine) with the entries for the active flags
+  removed — `block-cloud` (cloud/cloudAPI/p2p_tnp) and the new `no-record`
+  (mp4record + a 1 MB tmpfs over `/tmp/sd/record`). The rmm→reboot
+  watchdog entry is always kept. `wp_cmd.block` is retired.
+- Deployment is pending: the camera has no shell while the hack is down, so
+  both changes ship with the card repair/replacement. Enable with
+  `touch /tmp/sd/hack/no-record`.
+- Architecture decision: **the camera is a sensor; recording belongs on
+  the HA/NAS side** (HA `camera.record` / Frigate over RTSP). The SD then
+  holds only the hack and small logs. If on-camera recording is ever kept,
+  use a high-endurance card — the current 15 GB generic card carried 12 GB
+  of rolling 1-minute segments.
+
 ## Primary objective (IN PROGRESS): prove fshare2fifo's emission is clean
 
 1. The v2 lock-free reader (commit d34df8c, live-edge jump f2c786b) is

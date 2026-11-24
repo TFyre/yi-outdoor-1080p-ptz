@@ -58,14 +58,18 @@ on the SD root is a one-liner that execs `hack/boot.sh` at every boot.
   `scp -O` execs a remote `scp -t`, which must resolve to something), starts
   the web pad (busybox httpd, 8080) and ONVIF (8082), then spawns
   `start-rtsp.sh` detached (the stock boot may wait for debug.sh to
-  return). **Cloud block** (opt-in via `$HACK/block-cloud`, active since
-  2026-09-01): kills `cloud`/`cloudAPI`/`p2p_tnp`, bind-mounts
-  `etc/wp_cmd.block` over `/home/app/wp_cmd` and restarts watch_process
-  on the shadow (keeps the rmm→reboot entry), sinks the 4 cloud
-  hostnames in `/etc/hosts`, starts busybox ntpd for the clock.
-  Un-flag + reboot = stock. Applet liveness guards must be
-  `ps | grep -q "[n]tpd"` style — `pidof` never matches busybox
-  applets (their comm is `busybox1.36.1`).
+  return). **Process blocks** — composable opt-in flags: `$HACK/block-cloud`
+  kills `cloud`/`cloudAPI`/`p2p_tnp`; `$HACK/no-record` kills `mp4record`
+  and mounts a 1 MB tmpfs over `/tmp/sd/record` (the stock app writes
+  ~12 GB of rolling 1-min mp4 segments there — the SD-wear driver). Boot
+  builds a filtered copy of `etc/wp_cmd.orig` (the pristine
+  `/home/app/wp_cmd`) with the blocked entries removed, bind-mounts it
+  over `/home/app/wp_cmd` and restarts watch_process on the shadow; the
+  rmm→reboot entry is ALWAYS kept (the camera's self-recovery). With
+  cloud blocked it also sinks the 4 cloud hostnames in `/etc/hosts` and
+  starts busybox ntpd for the clock. Un-flag + reboot = stock. Applet
+  liveness guards must be `ps | grep -q "[n]tpd"` style — `pidof` never
+  matches busybox applets (their comm is `busybox1.36.1`).
 - `hack/start-rtsp.sh` — waits for `/dev/shm/fshare_frame_buf` (the app
   creates it once the camera pipeline is up), then starts the chain in
   this order: **f2f_audio first** (ADTSAudioFifoSource::createNew sits in
@@ -87,6 +91,12 @@ on the SD root is a one-liner that execs `hack/boot.sh` at every boot.
   TLS), dropbearmulti 2026.94 (built from source), fshare2fifo, f2f_audio
   (the same binary under a name whose comm fits pidof; argv[0] dispatch
   turns on audio mode), rRTSPServer.
+- **Stock system RE** — the full boot chain, the stock inetd services,
+  `checkdisk`'s reformat path, the recording behaviour and the
+  **"there is no root password"** finding (root has `x` in `/etc/passwd`
+  but there is no `/etc/shadow` anywhere, so the port-23 telnet login can
+  never authenticate) are documented in `docs/stock-system.md`, together
+  with the recipe for unpacking the stock rootfs from the mtd3 dump.
 - `hack/root/.ssh/authorized_keys` — pubkeys boot.sh installs to
   `/root/.ssh/` each boot (the ramdisk resets). The repo ships only
   `authorized_keys.example`; the real file is gitignored and must exist
